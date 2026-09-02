@@ -27,10 +27,19 @@ ARCHIVE = os.environ.get("READDAILY_ARCHIVE") or os.path.expanduser(
     "~/Library/Application Support/readdaily/news-archive")
 VAULT = os.environ.get("READDAILY_VAULT") or os.path.expanduser(
     "~/Library/Application Support/readdaily/vault")
+_SETTINGS = os.path.expanduser("~/Library/Application Support/readdaily/settings.json")
+if not os.environ.get("READDAILY_VAULT") and os.path.exists(_SETTINGS):
+    _v = (load_json(_SETTINGS, {}) or {}).get("vault")
+    if _v:
+        VAULT = os.path.expanduser(_v)
 TAGS = ["政治", "经济", "军事", "民生", "生产", "科技", "文化", "生态", "其他"]
 DAILY_LOG = ((os.environ.get("READDAILY_ARCHIVE")
               or os.path.expanduser("~/Library/Application Support/readdaily/news-archive"))
              + "/_dailylog.jsonl")
+
+
+def safe_name(s):
+    return re.sub(r'[\\/:*?"<>|\s]+', "_", str(s)).strip("_")[:80]
 
 
 def issues_of(d, only_unsummarized=True):
@@ -49,7 +58,17 @@ def issues_of(d, only_unsummarized=True):
 
 
 def read_unit_text(aunit, issue_dir):
-    p = os.path.join(issue_dir, aunit.get("text_path", ""))
+    tp = aunit.get("text_path")
+    if not tp:
+        # 内嵌文本渠道（founder/paper_api 等：unit.text + articles[].text）
+        parts = []
+        if aunit.get("text"):
+            parts.append(aunit["text"])
+        for a in (aunit.get("articles") or []):
+            if a.get("text"):
+                parts.append(a["text"])
+        return "\n\n".join(parts)
+    p = os.path.join(issue_dir, tp)
     try:
         with open(p, encoding="utf-8") as f:
             return f.read()

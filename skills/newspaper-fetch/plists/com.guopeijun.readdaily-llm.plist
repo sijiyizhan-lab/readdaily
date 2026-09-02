@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.guopeijun.readdaily-llm</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/bin/python3</string>
+		<string>__REPO__/scripts/readdaily.py</string>
+		<string>all</string>
+	</array>
+	<key>StartCalendarInterval</key>
+	<array>
+		<dict>
+			<key>Hour</key><integer>10</integer>
+			<key>Minute</key><integer>50</integer>
+		</dict>
+		<dict>
+			<key>Hour</key><integer>20</integer>
+			<key>Minute</key><integer>15</integer>
+		</dict>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>__HOME__</string>
+	<key>StandardOutPath</key>
+	<string>__HOME__/Library/Logs/readdaily-llm.log</string>
+	<key>StandardErrorPath</key>
+	<string>__HOME__/Library/Logs/readdaily-llm.err.log</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key><string>__HOME__</string>
+		<key>PATH</key><string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>LANG</key><string>zh_CN.UTF-8</string>
+		<key>READDAILY_ARCHIVE</key><string>__HOME__/Library/Application Support/readdaily/news-archive</string>
+		<key>READDAILY_VAULT</key><string>__HOME__/Library/Application Support/readdaily/vault</string>
+	</dict>
+</dict>
+</plist>

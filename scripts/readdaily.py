@@ -122,7 +122,7 @@ def cmd_query(args):
 def main():
     ap = argparse.ArgumentParser(description="readdaily CLI")
     ap.add_argument("cmd", choices=["fetch", "prepare", "ingest", "archive", "digest",
-                                    "tracking", "query", "status"])
+                                    "tracking", "query", "status", "all"])
     ap.add_argument("cmd2", nargs="?", default=None, help="reader 子命令（prepare/ingest/…）")
     ap.add_argument("--date", default=None, help="YYYY-MM-DD")
     ap.add_argument("--source", default=None, help="源 id（逗号分隔）")
@@ -133,6 +133,12 @@ def main():
     ap.add_argument("--days", type=int, default=2, help="query 回溯天数")
     args = ap.parse_args()
 
+    if args.cmd == "all":
+        LP = os.path.join(REPO, "skills", "newspaper-reader", "scripts", "llm_pipeline.py")
+        cmd = [sys.executable, LP, "all"]
+        if args.date:
+            cmd += ["--date", args.date]
+        sys.exit(subprocess.run(cmd).returncode)
     if args.cmd == "fetch":
         sys.exit(cmd_fetch(args))
     if args.cmd == "status":

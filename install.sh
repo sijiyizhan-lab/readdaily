@@ -63,11 +63,11 @@ fi
 
 # 3) 定时任务（macOS launchd；其他平台给出 cron 建议）
 if [[ "$(uname)" == "Darwin" ]]; then
-  for spec in com.guopeijun.daily-reader com.guopeijun.jianshebao-daily; do
+  for spec in com.guopeijun.daily-reader com.guopeijun.jianshebao-daily com.guopeijun.readdaily-llm; do
     src="$REPO_DIR/skills/newspaper-fetch/plists/$spec.plist"
     dst="$HOME/Library/LaunchAgents/$spec.plist"
     if [[ -f "$src" ]]; then
-      run sed "s|__HOME__|$HOME|g" "$src" > "$dst"
+      run sed -e "s|__HOME__|$HOME|g" -e "s|__REPO__|$REPO_DIR|g" "$src" > "$dst"
       run launchctl bootout "gui/$(id -u)/$spec" 2>/dev/null || true
       run launchctl bootstrap "gui/$(id -u)" "$dst" || log "bootstrap 跳过（launchd 状态异常时手动执行）"
     fi

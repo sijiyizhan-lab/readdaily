@@ -33,6 +33,23 @@ sources.json（注册表：渠道类型/入口/启用状态）
   └─ readdaily.py CLI（fetch/status/query/tracking/ingest/archive/digest）
 ```
 
+## 无人值守模式（可选，推荐）
+
+配置一次即可全自动：每天 10:25/20:00 抓取，10:50/20:15 由 LLM 完成
+归纳→Obsidian 归档→每日摘要→主体跟踪，全程无需人类/Agent 会话。
+
+```bash
+# 1) 配置 LLM（OpenAI 兼容；密钥只存本机，不入仓库）
+mkdir -p ~/Library/Application\ Support/readdaily/news-archive
+cat > ~/Library/Application\ Support/readdaily/news-archive/llm.json <<'EOF'
+{"base_url": "https://api.deepseek.com/v1", "model": "deepseek-chat", "api_key": "sk-..."}
+EOF
+chmod 600 ~/Library/Application\ Support/readdaily/news-archive/llm.json
+
+# 2) 安装即含 com.guopeijun.readdaily-llm 任务；或手动补跑
+python3 scripts/readdaily.py all            # 抓取+归纳+归档+摘要+跟踪（幂等）
+```
+
 ## 子命令
 
 | 命令 | 说明 |
