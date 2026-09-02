@@ -26,9 +26,22 @@ struct PayloadMapperTests {
         #expect(issues.map(\.sourceID) == ["zgjsb"])
     }
 
+    @Test("新 dashboard 结构映射固定分类、缺报和真实阅读状态")
+    func mapsDailyDashboardRegistryShape() throws {
+        let data = try payload(#"{"date":"2026-09-03","categories":[{"id":"central_party","name":"中央党报","newspapers":[{"source":"rmrb","source_name":"人民日报","category_id":"central_party","date":"2026-09-03","available":true,"acquisition_status":"complete","reading_status":"completed","issue_no":"123"},{"source":"gmrb","source_name":"光明日报","category_id":"central_party","date":"2026-09-03","available":false,"acquisition_status":"pending","reading_status":"unread"}]}],"newspapers":[],"stats":{"expected_count":8,"available_count":1}}"#)
+
+        let day = try WorkbenchPayloadMapper().dailyDashboard(from: data)
+        let entries = day.sections.flatMap(\.entries)
+
+        #expect(day.date == "2026-09-03")
+        #expect(entries.count == 8)
+        #expect(entries.first(where: { $0.source.id == "rmrb" })?.readingStatus == .completed)
+        #expect(entries.first(where: { $0.source.id == "gmrb" })?.status == .notStarted)
+    }
+
     @Test("期次按版面单元映射原图、OCR、摘要、主题和事实")
     func mapsIssueUnitsIntoReviewEditions() throws {
-        let data = try payload(#"{"source":"zgjsb","source_name":"中国建设报","date":"2026-09-01","issue_no":"9168","pdf_path":"/archive/source.pdf","units":[{"id":"zgjsb_20260901_01","edition_no":1,"edition_name":"要闻","title":"1版 要闻","page_image":"/archive/page-01.jpg","text":"OCR 正文","summary":"摘要","topics":["城市更新与城市治理"],"facts":[{"subject":"住建部","action":"发布","object":"标准","value":"12","unit":"项","time":"9月","source":"第1版"},{"subject":"企业","action":"投资","object":"项目","value":"20","unit":"亿元","time":"9月","source":"第1版"}],"importance":5,"warnings":[]}],"warnings":[]}"#)
+        let data = try payload(#"{"source":"zgjsb","source_name":"中国建设报","date":"2026-09-01","issue_no":"9168","evidence_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","pdf_path":"/archive/source.pdf","units":[{"id":"zgjsb_20260901_01","edition_no":1,"edition_name":"要闻","title":"1版 要闻","page_image":"/archive/page-01.jpg","text":"OCR 正文","summary":"摘要","topics":["城市更新与城市治理"],"facts":[{"subject":"住建部","action":"发布","object":"标准","value":"12","unit":"项","time":"9月","source":"第1版"},{"subject":"企业","action":"投资","object":"项目","value":"20","unit":"亿元","time":"9月","source":"第1版"}],"importance":5,"warnings":[]}],"warnings":[]}"#)
 
         let issue = try WorkbenchPayloadMapper().issue(from: data)
 
@@ -42,6 +55,27 @@ struct PayloadMapperTests {
         #expect(issue.editions[0].articles[0].facts[0].subject == "住建部")
         #expect(issue.editions[0].articles[0].facts[1].subject == "企业")
         #expect(issue.editions[0].articles[0].importance == 5)
+    }
+
+    @Test("后端没有事实时保持空数组而不是制造空事实")
+    func preservesEmptyFactsForIncrementalDrafts() throws {
+        let data = try payload(#"{"source":"zgjsb","date":"2026-09-03","evidence_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","units":[{"id":"zgjsb_20260903_01","edition_no":1,"edition_name":"要闻","text":"OCR 正文","summary":"","topics":[],"facts":[]}]}"#)
+
+        let issue = try WorkbenchPayloadMapper().issue(from: data)
+
+        #expect(issue.editions[0].articles[0].facts.isEmpty)
+    }
+
+    @Test("期次保留后端文章块标题顺序与原始空白")
+    func preservesStructuredOCRBlocksVerbatim() throws {
+        let data = try payload(#"{"source":"zgjsb","date":"2026-09-03","evidence_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","units":[{"id":"p1","edition_no":1,"text":"标题甲\n正文甲\n\n正文乙","ocr_blocks":[{"kind":"article","title":"标题甲","text":"正文甲\n  缩进不改"},{"kind":"paragraph","title":null,"text":"正文乙  "}]}]}"#)
+
+        let issue = try WorkbenchPayloadMapper().issue(from: data)
+        let blocks = issue.editions[0].articles[0].ocrBlocks
+
+        #expect(blocks.map(\.kind) == ["article", "paragraph"])
+        #expect(blocks.map(\.title) == ["标题甲", nil])
+        #expect(blocks.map(\.text) == ["正文甲\n  缩进不改", "正文乙  "])
     }
 
     @Test("发布预览识别新增和修改文件")

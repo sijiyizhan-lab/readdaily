@@ -134,6 +134,7 @@ public struct IssueSummary: Codable, Equatable, Hashable, Identifiable, Sendable
     public let date: String
     public let issueNumber: String?
     public let stage: String?
+    public let readingStatus: String?
     public let warningCount: Int
     public let pageCount: Int?
     public let warnings: [String]
@@ -149,6 +150,7 @@ public struct IssueSummary: Codable, Equatable, Hashable, Identifiable, Sendable
         case date
         case issueNumber = "issue_number"
         case stage
+        case readingStatus = "reading_status"
         case warningCount = "warning_count"
         case pageCount = "page_count"
         case warnings
@@ -161,6 +163,7 @@ public struct IssueSummary: Codable, Equatable, Hashable, Identifiable, Sendable
         date: String,
         issueNumber: String? = nil,
         stage: String? = nil,
+        readingStatus: String? = nil,
         warningCount: Int = 0,
         pageCount: Int? = nil,
         warnings: [String] = []
@@ -171,6 +174,7 @@ public struct IssueSummary: Codable, Equatable, Hashable, Identifiable, Sendable
         self.date = date
         self.issueNumber = issueNumber
         self.stage = stage
+        self.readingStatus = readingStatus
         self.warningCount = warningCount
         self.pageCount = pageCount
         self.warnings = warnings
@@ -186,6 +190,7 @@ public struct IssueSummary: Codable, Equatable, Hashable, Identifiable, Sendable
         date = try container.decodeIfPresent(String.self, forKey: .date) ?? "未知日期"
         issueNumber = try container.decodeIfPresent(String.self, forKey: .issueNumber)
         stage = try container.decodeIfPresent(String.self, forKey: .stage)
+        readingStatus = try container.decodeIfPresent(String.self, forKey: .readingStatus)
         warningCount = try container.decodeIfPresent(Int.self, forKey: .warningCount) ?? 0
         pageCount = try container.decodeIfPresent(Int.self, forKey: .pageCount)
         warnings = try container.decodeIfPresent([String].self, forKey: .warnings) ?? []
@@ -199,6 +204,7 @@ public struct IssueSummary: Codable, Equatable, Hashable, Identifiable, Sendable
         try container.encode(date, forKey: .date)
         try container.encodeIfPresent(issueNumber, forKey: .issueNumber)
         try container.encodeIfPresent(stage, forKey: .stage)
+        try container.encodeIfPresent(readingStatus, forKey: .readingStatus)
         try container.encode(warningCount, forKey: .warningCount)
         try container.encodeIfPresent(pageCount, forKey: .pageCount)
         try container.encode(warnings, forKey: .warnings)

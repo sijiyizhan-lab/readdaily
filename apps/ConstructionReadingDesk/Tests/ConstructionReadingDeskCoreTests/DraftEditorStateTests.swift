@@ -64,6 +64,10 @@ struct DraftEditorStateTests {
         let unit = DraftUnit(
             id: "zgjsb_20260901_01",
             title: "城市更新标题",
+            ocrText: "原始 OCR",
+            proofreadText: "人工校对 OCR",
+            ocrReviewStatus: .confirmed,
+            ocrSuspicions: [],
             summary: "摘要",
             topics: [.urbanRenewal],
             facts: [
@@ -72,15 +76,25 @@ struct DraftEditorStateTests {
             ],
             importance: 4
         )
-        let request = DraftSaveRequest(source: "zgjsb", date: "2026-09-01", units: [unit])
+        let evidence = String(repeating: "d", count: 64)
+        let request = DraftSaveRequest(
+            source: "zgjsb",
+            date: "2026-09-01",
+            evidenceSHA256: evidence,
+            units: [unit]
+        )
 
         let object = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(request)) as? [String: Any])
         let units = try #require(object["units"] as? [[String: Any]])
+        #expect(object["evidence_sha256"] as? String == evidence)
 
         #expect(object["source"] as? String == "zgjsb")
         #expect(object["source_id"] == nil)
         #expect(units.first?["id"] as? String == "zgjsb_20260901_01")
         #expect(units.first?["title"] as? String == "城市更新标题")
+        #expect(units.first?["ocr_text"] as? String == "原始 OCR")
+        #expect(units.first?["corrected_ocr_text"] as? String == "人工校对 OCR")
+        #expect(units.first?["proofread_status"] as? String == "confirmed")
         #expect((units.first?["facts"] as? [[String: Any]])?.count == 2)
         #expect(units.first?["importance"] as? Int == 4)
     }
@@ -101,5 +115,32 @@ struct DraftEditorStateTests {
 
         #expect(decoded.title == original.title)
         #expect(decoded.facts == original.facts)
+    }
+
+    @Test("普通保存只发送改动版次而发布预览校验整期")
+    func draftSaveScopeIsIncrementalButPublishScopeIsComplete() {
+        let all = ["p1", "p2", "p3"]
+
+        #expect(DraftSaveScope.unitIDs(all: all, dirty: ["p2"], requireCompleteIssue: false) == ["p2"])
+        #expect(DraftSaveScope.unitIDs(all: all, dirty: ["p2"], requireCompleteIssue: true) == all)
+    }
+
+    @Test("发布计划只可用于生成时对应的已保存编辑版本")
+    func publishPlanRevisionMustRemainCurrentAndClean() {
+        #expect(PublishRevisionPolicy.canUsePlan(
+            previewRevision: 7,
+            currentRevision: 7,
+            hasUnsavedChanges: false
+        ))
+        #expect(!PublishRevisionPolicy.canUsePlan(
+            previewRevision: 7,
+            currentRevision: 8,
+            hasUnsavedChanges: false
+        ))
+        #expect(!PublishRevisionPolicy.canUsePlan(
+            previewRevision: 7,
+            currentRevision: 7,
+            hasUnsavedChanges: true
+        ))
     }
 }

@@ -1,7 +1,7 @@
 {
  "schema_version": 1,
- "updated": "2026-09-02",
- "archive_root": "/Users/guopeijun/Library/Application Support/readdaily/news-archive",
+ "updated": "2026-09-03",
+ "archive_root": "~/Library/Application Support/readdaily/news-archive",
  "sources": [
   {
    "id": "zgjsb",
@@ -21,7 +21,7 @@
    "anti": {
     "rate_s": 3
    },
-   "out": "/Users/guopeijun/Library/Application Support/readdaily/wechat-articles"
+   "out": "~/Library/Application Support/readdaily/wechat-articles"
   },
   {
    "id": "rmrb",

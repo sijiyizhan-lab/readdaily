@@ -4,11 +4,34 @@ public struct ReadDailyConfiguration: Equatable, Sendable {
     public var repositoryURL: URL
     public var archiveURL: URL
     public var vaultURL: URL
+    public var pythonExecutableURL: URL
 
-    public init(repositoryURL: URL, archiveURL: URL, vaultURL: URL) {
+    public init(
+        repositoryURL: URL,
+        archiveURL: URL,
+        vaultURL: URL,
+        pythonExecutableURL: URL? = nil
+    ) {
         self.repositoryURL = repositoryURL
         self.archiveURL = archiveURL
         self.vaultURL = vaultURL
+        self.pythonExecutableURL = pythonExecutableURL ?? Self.detectedPythonExecutableURL
+    }
+
+    public static var detectedPythonExecutableURL: URL {
+        if let configured = ProcessInfo.processInfo.environment["READDAILY_PYTHON"],
+           !configured.isEmpty {
+            return URL(fileURLWithPath: (configured as NSString).expandingTildeInPath)
+        }
+        let candidates = [
+            "/opt/homebrew/bin/python3",
+            "/usr/local/bin/python3",
+            "/usr/bin/python3",
+        ]
+        if let path = candidates.first(where: FileManager.default.isExecutableFile(atPath:)) {
+            return URL(fileURLWithPath: path)
+        }
+        return URL(fileURLWithPath: "/usr/bin/python3")
     }
 
     public static var detectedDefaults: ReadDailyConfiguration {
@@ -23,6 +46,8 @@ public struct ReadDailyConfiguration: Equatable, Sendable {
 
 public enum ReadDailyAPICommand: Equatable, Sendable {
     case capabilities
+    case newspaperRegistry
+    case dailyDashboard(date: String? = nil)
     case inbox(source: String? = nil, date: String? = nil)
     case issue(source: String, date: String)
     case draftSave(inputFile: URL)
@@ -31,6 +56,8 @@ public enum ReadDailyAPICommand: Equatable, Sendable {
     case publishApply(planID: String)
     case history
     case rollback(transactionID: String)
+    case readingMark(source: String, date: String, status: ReadingCompletionStatus)
+    case fetchDaily(date: String)
     case fetchConstruction(date: String? = nil)
 }
 
@@ -68,13 +95,25 @@ public struct ReadDailyCommandFactory: Sendable {
         let environment = [
             "READDAILY_ARCHIVE": configuration.archiveURL.path,
             "READDAILY_VAULT": configuration.vaultURL.path,
+            // The bundled runtime is inside the signed app and must remain
+            // byte-for-byte immutable after Python imports its modules.
+            "PYTHONDONTWRITEBYTECODE": "1",
         ]
 
         if case .fetchConstruction(let date) = command {
             var arguments = [script, "fetch", "--source", "zgjsb"]
             append("--date", date, to: &arguments)
             return ProcessRequest(
-                executableURL: URL(fileURLWithPath: "/usr/bin/python3"),
+                executableURL: configuration.pythonExecutableURL,
+                arguments: arguments,
+                environment: environment
+            )
+        }
+        if case .fetchDaily(let date) = command {
+            var arguments = [script, "fetch"]
+            append("--date", date, to: &arguments)
+            return ProcessRequest(
+                executableURL: configuration.pythonExecutableURL,
                 arguments: arguments,
                 environment: environment
             )
@@ -84,8 +123,10 @@ public struct ReadDailyCommandFactory: Sendable {
         arguments += ["--archive", configuration.archiveURL.path, "--vault", configuration.vaultURL.path]
 
         switch command {
-        case .capabilities, .history:
+        case .capabilities, .newspaperRegistry, .history:
             break
+        case .dailyDashboard(let date):
+            append("--date", date, to: &arguments)
         case .inbox(let source, let date), .publishPlan(let source, let date):
             append("--source", source, to: &arguments)
             append("--date", date, to: &arguments)
@@ -104,12 +145,16 @@ public struct ReadDailyCommandFactory: Sendable {
         case .rollback(let transactionID):
             guard !transactionID.isEmpty else { throw CommandFactoryError.emptyIdentifier("发布记录编号") }
             arguments += ["--transaction-id", transactionID]
-        case .fetchConstruction:
+        case .readingMark(let source, let date, let status):
+            append("--source", source, to: &arguments)
+            append("--date", date, to: &arguments)
+            append("--status", status.rawValue, to: &arguments)
+        case .fetchDaily, .fetchConstruction:
             break
         }
 
         return ProcessRequest(
-            executableURL: URL(fileURLWithPath: "/usr/bin/python3"),
+            executableURL: configuration.pythonExecutableURL,
             arguments: arguments,
             environment: environment
         )
@@ -125,6 +170,8 @@ private extension ReadDailyAPICommand {
     var name: String {
         switch self {
         case .capabilities: return "capabilities"
+        case .newspaperRegistry: return "newspaper-registry"
+        case .dailyDashboard: return "daily-dashboard"
         case .inbox: return "inbox"
         case .issue: return "issue"
         case .draftSave: return "draft-save"
@@ -133,6 +180,8 @@ private extension ReadDailyAPICommand {
         case .publishApply: return "publish-apply"
         case .history: return "history"
         case .rollback: return "rollback"
+        case .readingMark: return "reading-mark"
+        case .fetchDaily: return "fetch"
         case .fetchConstruction: return "fetch"
         }
     }

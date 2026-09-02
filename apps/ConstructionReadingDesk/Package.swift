@@ -13,11 +13,12 @@ let package = Package(
         .target(name: "ConstructionReadingDeskCore"),
         .executableTarget(
             name: "ConstructionReadingDesk",
-            dependencies: ["ConstructionReadingDeskCore"]
+            dependencies: ["ConstructionReadingDeskCore"],
+            exclude: ["Resources"]
         ),
         .testTarget(
             name: "ConstructionReadingDeskCoreTests",
-            dependencies: ["ConstructionReadingDeskCore"],
+            dependencies: ["ConstructionReadingDeskCore", "ConstructionReadingDesk"],
             swiftSettings: [
                 // Some standalone Command Line Tools installations ship Swift
                 // Testing outside the compiler's default framework search path.

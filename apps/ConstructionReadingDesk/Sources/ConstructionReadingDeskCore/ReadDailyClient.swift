@@ -120,13 +120,13 @@ public enum ReadDailyClientError: LocalizedError, Equatable {
         case .scriptMissing:
             return "请在设置中重新选择 readdaily 仓库目录。"
         case .launchFailed:
-            return "请确认 /usr/bin/python3 可用，然后重试。"
+            return "请安装 Python 3，或通过 READDAILY_PYTHON 指定可执行文件后重试。"
         case .nonzeroExit:
             return "查看界面中的错误详情，修正路径或输入文件后重试。"
         case .emptyOutput, .invalidJSON:
             return "请确认客户端与仓库版本一致；详细日志只应写入 stderr。"
         case .incompatibleSchema:
-            return "请升级建设读报台或切换到兼容版本的仓库。"
+            return "请升级 Read Daily 或切换到兼容版本的读报引擎。"
         case .backendRejected(_, let recovery):
             return recovery ?? "请按后端提示修正后重试。"
         case .draftEncoding:
@@ -210,6 +210,15 @@ public actor ReadDailyClient {
 
     public func fetchConstructionPaper(date: String? = nil) async throws -> String {
         let request = try validatedRequest(for: .fetchConstruction(date: date))
+        return try await performRawFetch(request)
+    }
+
+    public func fetchDaily(date: String) async throws -> String {
+        let request = try validatedRequest(for: .fetchDaily(date: date))
+        return try await performRawFetch(request)
+    }
+
+    private func performRawFetch(_ request: ProcessRequest) async throws -> String {
         let result = try await runner.run(request)
         guard result.terminationStatus == 0 else {
             throw ReadDailyClientError.nonzeroExit(

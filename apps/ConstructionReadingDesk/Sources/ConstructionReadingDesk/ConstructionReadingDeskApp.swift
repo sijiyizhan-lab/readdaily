@@ -12,9 +12,9 @@ struct ConstructionReadingDeskApp: App {
     }
 
     var body: some Scene {
-        WindowGroup("建设读报台") {
+        WindowGroup("Read Daily") {
             ReadingDeskRootView(settings: settings, viewModel: viewModel)
-                .frame(minWidth: 1240, minHeight: 760)
+                .frame(minWidth: 980, minHeight: 760)
         }
         .windowStyle(.titleBar)
         .windowToolbarStyle(.unifiedCompact(showsTitle: true))
@@ -22,7 +22,7 @@ struct ConstructionReadingDeskApp: App {
             CommandGroup(after: .newItem) {
                 Button("添加 PDF…") { NotificationCenter.default.post(name: .readingDeskImportPDF, object: nil) }
                     .keyboardShortcut("o", modifiers: .command)
-                Button("刷新收件箱") { viewModel.refresh() }
+                Button("刷新读报台") { viewModel.refresh() }
                     .keyboardShortcut("r", modifiers: .command)
                 Divider()
                 Button("保存整期草稿") { viewModel.saveDraft() }
@@ -33,7 +33,7 @@ struct ConstructionReadingDeskApp: App {
         }
 
         Settings {
-            SettingsPane(settings: settings)
+            SettingsPane(settings: settings, viewModel: viewModel)
         }
     }
 }

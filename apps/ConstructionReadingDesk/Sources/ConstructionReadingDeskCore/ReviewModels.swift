@@ -50,12 +50,33 @@ public struct FactFields: Codable, Equatable, Sendable {
             source: source.trimmed
         )
     }
+
+    public var isEmpty: Bool {
+        [subject, action, object, value, unit, time, source]
+            .allSatisfy { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
+}
+
+public struct OCRContentBlock: Codable, Equatable, Sendable {
+    public let kind: String
+    public let title: String?
+    public let text: String
+
+    public init(kind: String, title: String? = nil, text: String) {
+        self.kind = kind
+        self.title = title
+        self.text = text
+    }
 }
 
 public struct ArticleDraft: Codable, Equatable, Identifiable, Sendable {
     public var id: String
     public var title: String
     public var ocrText: String
+    public var ocrBlocks: [OCRContentBlock]
+    public var proofreadText: String
+    public var ocrReviewStatus: OCRReviewStatus
+    public var ocrSuspicions: [String]
     public var summary: String
     public var topics: Set<ReadingTopic>
     public var facts: [FactFields]
@@ -65,7 +86,13 @@ public struct ArticleDraft: Codable, Equatable, Identifiable, Sendable {
         case id
         case title
         case ocrText = "ocr_text"
+        case ocrBlocks = "ocr_blocks"
         case text
+        case correctedOCRText = "corrected_ocr_text"
+        case legacyProofreadText = "proofread_text"
+        case proofreadStatus = "proofread_status"
+        case legacyOCRReviewStatus = "ocr_review_status"
+        case ocrSuspicions = "ocr_suspicions"
         case summary
         case topics
         case category
@@ -77,6 +104,10 @@ public struct ArticleDraft: Codable, Equatable, Identifiable, Sendable {
         id: String,
         title: String,
         ocrText: String = "",
+        ocrBlocks: [OCRContentBlock] = [],
+        proofreadText: String? = nil,
+        ocrReviewStatus: OCRReviewStatus = .unreviewed,
+        ocrSuspicions: [String] = [],
         summary: String = "",
         topics: Set<ReadingTopic> = [],
         facts: [FactFields] = [FactFields()],
@@ -85,6 +116,10 @@ public struct ArticleDraft: Codable, Equatable, Identifiable, Sendable {
         self.id = id
         self.title = title
         self.ocrText = ocrText
+        self.ocrBlocks = ocrBlocks
+        self.proofreadText = proofreadText ?? ocrText
+        self.ocrReviewStatus = ocrReviewStatus
+        self.ocrSuspicions = ocrSuspicions
         self.summary = summary
         self.topics = topics
         self.facts = facts
@@ -98,6 +133,14 @@ public struct ArticleDraft: Codable, Equatable, Identifiable, Sendable {
         ocrText = try container.decodeIfPresent(String.self, forKey: .ocrText)
             ?? container.decodeIfPresent(String.self, forKey: .text)
             ?? ""
+        ocrBlocks = try container.decodeIfPresent([OCRContentBlock].self, forKey: .ocrBlocks) ?? []
+        proofreadText = try container.decodeIfPresent(String.self, forKey: .correctedOCRText)
+            ?? container.decodeIfPresent(String.self, forKey: .legacyProofreadText)
+            ?? ocrText
+        let rawReviewStatus = try container.decodeIfPresent(String.self, forKey: .proofreadStatus)
+            ?? container.decodeIfPresent(String.self, forKey: .legacyOCRReviewStatus)
+        ocrReviewStatus = OCRReviewStatus.fromBackend(rawReviewStatus)
+        ocrSuspicions = try container.decodeIfPresent([String].self, forKey: .ocrSuspicions) ?? []
         summary = try container.decodeIfPresent(String.self, forKey: .summary) ?? ""
         if let topicSet = try? container.decode(Set<ReadingTopic>.self, forKey: .topics) {
             topics = topicSet
@@ -121,6 +164,10 @@ public struct ArticleDraft: Codable, Equatable, Identifiable, Sendable {
         try container.encode(id, forKey: .id)
         try container.encode(title, forKey: .title)
         try container.encode(ocrText, forKey: .ocrText)
+        try container.encode(ocrBlocks, forKey: .ocrBlocks)
+        try container.encode(proofreadText, forKey: .correctedOCRText)
+        try container.encode(ocrReviewStatus.rawValue, forKey: .proofreadStatus)
+        try container.encode(ocrSuspicions, forKey: .ocrSuspicions)
         try container.encode(summary, forKey: .summary)
         try container.encode(topics, forKey: .topics)
         try container.encode(facts, forKey: .facts)
@@ -156,11 +203,80 @@ public struct DraftEditorState: Equatable, Sendable {
             id: draft.id,
             title: draft.title.trimmed,
             ocrText: draft.ocrText,
+            ocrBlocks: draft.ocrBlocks,
+            proofreadText: draft.proofreadText,
+            ocrReviewStatus: draft.ocrReviewStatus,
+            ocrSuspicions: draft.ocrSuspicions.map(\.trimmed).filter { !$0.isEmpty },
             summary: draft.summary.trimmed,
             topics: draft.topics,
             facts: draft.facts.map { $0.trimmingWhitespace() },
             importance: draft.importance
         )
+    }
+}
+
+public enum OCRReviewStatus: String, Codable, CaseIterable, Identifiable, Sendable {
+    case unreviewed
+    case edited
+    case confirmed
+
+    public var id: String { rawValue }
+
+    public var label: String {
+        switch self {
+        case .unreviewed: return "未校对"
+        case .edited: return "已编辑，待确认"
+        case .confirmed: return "已确认"
+        }
+    }
+
+    public var symbolName: String {
+        switch self {
+        case .unreviewed: return "circle.dashed"
+        case .edited: return "pencil.circle"
+        case .confirmed: return "checkmark.seal.fill"
+        }
+    }
+
+    public static func fromBackend(_ value: String?) -> OCRReviewStatus {
+        switch value {
+        case "confirmed", "verified": return .confirmed
+        case "edited", "in_progress", "needs_attention": return .edited
+        default: return .unreviewed
+        }
+    }
+}
+
+public struct OCRParagraph: Equatable, Identifiable, Sendable {
+    public let index: Int
+    public let lines: [String]
+
+    public var id: Int { index }
+}
+
+public struct OCRDocumentLayout: Equatable, Sendable {
+    public let verbatimText: String
+    public let paragraphs: [OCRParagraph]
+
+    public init(text: String) {
+        verbatimText = text
+        let lines = text.components(separatedBy: "\n")
+        var result: [OCRParagraph] = []
+        var current: [String] = []
+        for line in lines {
+            if line.isEmpty {
+                if !current.isEmpty {
+                    result.append(OCRParagraph(index: result.count, lines: current))
+                    current.removeAll(keepingCapacity: true)
+                }
+            } else {
+                current.append(line)
+            }
+        }
+        if !current.isEmpty {
+            result.append(OCRParagraph(index: result.count, lines: current))
+        }
+        paragraphs = result
     }
 }
 
@@ -197,6 +313,7 @@ public struct IssueDetail: Codable, Equatable, Sendable {
     public var sourceName: String
     public var date: String
     public var issueNumber: String?
+    public var evidenceSHA256: String
     public var editions: [EditionRecord]
     public var warnings: [String]
 
@@ -205,6 +322,7 @@ public struct IssueDetail: Codable, Equatable, Sendable {
         sourceName: String,
         date: String,
         issueNumber: String? = nil,
+        evidenceSHA256: String,
         editions: [EditionRecord],
         warnings: [String] = []
     ) {
@@ -212,6 +330,7 @@ public struct IssueDetail: Codable, Equatable, Sendable {
         self.sourceName = sourceName
         self.date = date
         self.issueNumber = issueNumber
+        self.evidenceSHA256 = evidenceSHA256
         self.editions = editions
         self.warnings = warnings
     }
@@ -220,14 +339,35 @@ public struct IssueDetail: Codable, Equatable, Sendable {
 public struct DraftUnit: Codable, Equatable, Sendable {
     public let id: String
     public let title: String
+    public let ocrText: String
+    public let proofreadText: String?
+    public let ocrReviewStatus: OCRReviewStatus
+    public let ocrSuspicions: [String]
     public let summary: String
     public let topics: [ReadingTopic]
     public let facts: [FactFields]
     public let importance: Int
 
+    enum CodingKeys: String, CodingKey {
+        case id
+        case title
+        case ocrText = "ocr_text"
+        case proofreadText = "corrected_ocr_text"
+        case ocrReviewStatus = "proofread_status"
+        case ocrSuspicions = "ocr_suspicions"
+        case summary
+        case topics
+        case facts
+        case importance
+    }
+
     public init(
         id: String,
         title: String,
+        ocrText: String = "",
+        proofreadText: String? = nil,
+        ocrReviewStatus: OCRReviewStatus = .unreviewed,
+        ocrSuspicions: [String] = [],
         summary: String,
         topics: Set<ReadingTopic>,
         facts: [FactFields],
@@ -235,22 +375,82 @@ public struct DraftUnit: Codable, Equatable, Sendable {
     ) {
         self.id = id
         self.title = title
+        self.ocrText = ocrText
+        if ocrReviewStatus == .unreviewed, proofreadText == nil || proofreadText == ocrText {
+            self.proofreadText = nil
+        } else {
+            self.proofreadText = proofreadText
+        }
+        self.ocrReviewStatus = ocrReviewStatus
+        self.ocrSuspicions = ocrSuspicions
         self.summary = summary
         self.topics = ReadingTopic.allCases.filter(topics.contains)
         self.facts = facts
         self.importance = min(max(importance, 1), 5)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(title, forKey: .title)
+        try container.encode(ocrText, forKey: .ocrText)
+        if let proofreadText {
+            try container.encode(proofreadText, forKey: .proofreadText)
+        } else {
+            try container.encodeNil(forKey: .proofreadText)
+        }
+        try container.encode(ocrReviewStatus, forKey: .ocrReviewStatus)
+        try container.encode(ocrSuspicions, forKey: .ocrSuspicions)
+        try container.encode(summary, forKey: .summary)
+        try container.encode(topics, forKey: .topics)
+        try container.encode(facts, forKey: .facts)
+        try container.encode(importance, forKey: .importance)
     }
 }
 
 public struct DraftSaveRequest: Codable, Equatable, Sendable {
     public let source: String
     public let date: String
+    public let evidenceSHA256: String
     public let units: [DraftUnit]
 
-    public init(source: String, date: String, units: [DraftUnit]) {
+    enum CodingKeys: String, CodingKey {
+        case source
+        case date
+        case evidenceSHA256 = "evidence_sha256"
+        case units
+    }
+
+    public init(
+        source: String,
+        date: String,
+        evidenceSHA256: String,
+        units: [DraftUnit]
+    ) {
         self.source = source
         self.date = date
+        self.evidenceSHA256 = evidenceSHA256
         self.units = units
+    }
+}
+
+public enum DraftSaveScope {
+    public static func unitIDs(
+        all: [String],
+        dirty: Set<String>,
+        requireCompleteIssue: Bool
+    ) -> [String] {
+        requireCompleteIssue ? all : all.filter(dirty.contains)
+    }
+}
+
+public enum PublishRevisionPolicy {
+    public static func canUsePlan(
+        previewRevision: Int?,
+        currentRevision: Int,
+        hasUnsavedChanges: Bool
+    ) -> Bool {
+        previewRevision == currentRevision && !hasUnsavedChanges
     }
 }
 

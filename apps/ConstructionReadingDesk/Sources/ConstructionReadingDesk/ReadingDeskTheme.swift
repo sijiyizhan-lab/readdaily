@@ -1,4 +1,5 @@
 import AppKit
+import ConstructionReadingDeskCore
 import SwiftUI
 
 enum ReadingDeskTheme {
@@ -32,6 +33,26 @@ enum ReadingDeskTheme {
         light: NSColor(calibratedRed: 0.160, green: 0.514, blue: 0.490, alpha: 1),
         dark: NSColor(calibratedRed: 0.380, green: 0.745, blue: 0.690, alpha: 1)
     )
+    static let accentText = accessible(
+        "reading-desk-accent-text",
+        light: ReadDailyAccessibilityColors.accentTextLight,
+        dark: ReadDailyAccessibilityColors.accentTextDark
+    )
+    static let statusPositive = accessible(
+        "reading-desk-status-positive",
+        light: ReadDailyAccessibilityColors.positiveTextLight,
+        dark: ReadDailyAccessibilityColors.positiveTextDark
+    )
+    static let statusAttention = accessible(
+        "reading-desk-status-attention",
+        light: ReadDailyAccessibilityColors.attentionTextLight,
+        dark: ReadDailyAccessibilityColors.attentionTextDark
+    )
+    static let statusFailure = accessible(
+        "reading-desk-status-failure",
+        light: ReadDailyAccessibilityColors.failureTextLight,
+        dark: ReadDailyAccessibilityColors.failureTextDark
+    )
     static let accentSoft = adaptive(
         "reading-desk-accent-soft",
         light: NSColor(calibratedRed: 0.855, green: 0.932, blue: 0.910, alpha: 1),
@@ -62,6 +83,19 @@ enum ReadingDeskTheme {
         Color(nsColor: NSColor(name: NSColor.Name(name)) { appearance in
             appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light
         })
+    }
+
+    private static func accessible(_ name: String, light: SRGBColor, dark: SRGBColor) -> Color {
+        adaptive(name, light: nsColor(light), dark: nsColor(dark))
+    }
+
+    private static func nsColor(_ color: SRGBColor) -> NSColor {
+        NSColor(
+            calibratedRed: color.red,
+            green: color.green,
+            blue: color.blue,
+            alpha: 1
+        )
     }
 }
 

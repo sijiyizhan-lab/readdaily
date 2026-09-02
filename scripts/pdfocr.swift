@@ -94,8 +94,10 @@ func run() throws {
 
     var results: [PageResult] = []
     for index in 0..<document.pageCount {
-        guard let page = document.page(at: index) else { continue }
         let number = index + 1
+        guard let page = document.page(at: index) else {
+            throw PDFOCRError.cannotRender(number)
+        }
         let image = try pageImage(page, number: number)
         let imageName = String(format: "%02d版.jpg", number)
         let textName = String(format: "edition_%02d.txt", number)

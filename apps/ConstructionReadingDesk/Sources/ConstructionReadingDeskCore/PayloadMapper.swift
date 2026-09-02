@@ -12,7 +12,7 @@ public enum PayloadMappingError: LocalizedError, Equatable {
     }
 
     public var recoverySuggestion: String? {
-        "请确认建设读报台与 readdaily 仓库版本一致。"
+        "请确认 Read Daily 与读报引擎版本一致。"
     }
 }
 
@@ -34,13 +34,78 @@ public struct WorkbenchPayloadMapper: Sendable {
                 date: date,
                 issueNumber: row.string("issue_no", "issue_number"),
                 stage: row.string("status", "stage"),
-                warningCount: warnings.count,
+                readingStatus: row.string("reading_status"),
+                warningCount: row.integer("warning_count") ?? warnings.count,
                 pageCount: row.object("coverage")?.integer("editions") ?? row.integer("page_count"),
                 warnings: warnings
             )
         }
         guard let sourceID else { return issues }
         return issues.filter { $0.sourceID == sourceID }
+    }
+
+    public func dailyDashboard(from value: JSONValue?) throws -> DailyReadingDay {
+        let root = try object(value, context: "每日仪表盘")
+        guard let date = root.string("date") else {
+            throw PayloadMappingError.missingField("date")
+        }
+        var values = root["newspapers"]?.arrayValue ?? []
+        if values.isEmpty {
+            values = (root["categories"]?.arrayValue ?? []).flatMap { category in
+                category.objectValue?["newspapers"]?.arrayValue ?? []
+            }
+        }
+        let rows = Dictionary(
+            values.compactMap { value -> (String, [String: JSONValue])? in
+                guard let row = value.objectValue,
+                      let source = row.string("source", "source_id") else { return nil }
+                return (source, row)
+            },
+            uniquingKeysWith: { current, _ in current }
+        )
+        let sections = NewspaperCategory.allCases.map { category in
+            DailyNewspaperSection(
+                category: category,
+                entries: NewspaperRegistry.dailySources
+                    .filter { $0.category == category }
+                    .map { source in
+                        guard let row = rows[source.id] else {
+                            return DailyNewspaperEntry(source: source, issue: nil)
+                        }
+                        let rowStatus = row.string("status", "stage")
+                        let acquisitionStatus = row.string("acquisition_status") ?? rowStatus
+                        let status = dailyStatus(
+                            rowStatus ?? acquisitionStatus,
+                            available: row.boolean("available")
+                        )
+                        let readingStatus = ReadingCompletionStatus(rawValue: row.string("reading_status") ?? "unread") ?? .unread
+                        let warnings = row.strings("warnings")
+                        let issue: IssueSummary? = row.boolean("available") == false ? nil : IssueSummary(
+                            id: row.string("id"),
+                            sourceID: source.id,
+                            sourceName: row.string("source_name") ?? source.name,
+                            date: row.string("date") ?? date,
+                            issueNumber: row.string("issue_no", "issue_number"),
+                            stage: rowStatus ?? acquisitionStatus,
+                            readingStatus: readingStatus.rawValue,
+                            warningCount: row.integer("warning_count") ?? warnings.count,
+                            pageCount: row.object("coverage")?.integer("editions") ?? row.integer("page_count"),
+                            warnings: warnings
+                        )
+                        return DailyNewspaperEntry(
+                            source: source,
+                            issue: issue,
+                            status: status,
+                            readingStatus: readingStatus
+                        )
+                    }
+            )
+        }
+        return DailyReadingDay(
+            date: date,
+            sections: sections,
+            availableDates: root.strings("available_dates")
+        )
     }
 
     public func issue(from value: JSONValue?) throws -> IssueDetail {
@@ -51,6 +116,10 @@ public struct WorkbenchPayloadMapper: Sendable {
         }
         guard let date = root.string("date") else {
             throw PayloadMappingError.missingField("date")
+        }
+        guard let evidenceSHA256 = root.string("evidence_sha256"),
+              !evidenceSHA256.isEmpty else {
+            throw PayloadMappingError.missingField("evidence_sha256")
         }
         let sourceName = root.string("source_name", "sourceName") ?? source
         let pdfPath = root.string("pdf_path")
@@ -75,13 +144,27 @@ public struct WorkbenchPayloadMapper: Sendable {
             } ?? []
             let warnings = unit.strings("warnings")
             issueWarnings.append(contentsOf: warnings)
+            let ocrText = unit.string("ocr_text", "text") ?? ""
+            let ocrBlocks = (unit["ocr_blocks"]?.arrayValue ?? []).compactMap { blockValue -> OCRContentBlock? in
+                guard let block = blockValue.objectValue,
+                      let text = block.string("text") else { return nil }
+                return OCRContentBlock(
+                    kind: block.string("kind") ?? "paragraph",
+                    title: block.string("title"),
+                    text: text
+                )
+            }
             let article = ArticleDraft(
                 id: id,
                 title: title,
-                ocrText: unit.string("text", "ocr_text") ?? "",
+                ocrText: ocrText,
+                ocrBlocks: ocrBlocks,
+                proofreadText: unit.string("corrected_ocr_text", "proofread_text") ?? ocrText,
+                ocrReviewStatus: OCRReviewStatus.fromBackend(unit.string("proofread_status", "ocr_review_status")),
+                ocrSuspicions: unit.strings("ocr_suspicions"),
                 summary: unit.string("summary") ?? "",
                 topics: topics,
-                facts: facts.isEmpty ? [FactFields()] : facts,
+                facts: facts,
                 importance: unit.integer("importance") ?? 3
             )
             return EditionRecord(
@@ -99,6 +182,7 @@ public struct WorkbenchPayloadMapper: Sendable {
             sourceName: sourceName,
             date: date,
             issueNumber: root.string("issue_no", "issue_number"),
+            evidenceSHA256: evidenceSHA256,
             editions: editions,
             warnings: Array(Set(issueWarnings)).sorted()
         )
@@ -147,6 +231,19 @@ public struct WorkbenchPayloadMapper: Sendable {
             throw PayloadMappingError.expectedObject(context)
         }
         return object
+    }
+
+    private func dailyStatus(_ rawValue: String?, available: Bool?) -> DailyRunStatus {
+        switch rawValue {
+        case "published": return .published
+        case "ready_to_publish": return .readyToPublish
+        case "review_complete": return .reviewComplete
+        case "success", "complete", "ready", "needs_review": return .readyForReview
+        case "pending", "running", "processing", "fetching", "ocr": return available == false ? .notStarted : .running
+        case "failed", "error": return .failed
+        case "missing": return .notStarted
+        default: return available == true ? .readyForReview : .notStarted
+        }
     }
 }
 

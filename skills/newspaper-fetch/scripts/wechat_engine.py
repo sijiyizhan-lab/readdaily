@@ -38,8 +38,16 @@ UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36")  # 与已装 Chrome 一致；旧 UA 被搜狗拉黑
 SG_REF = "https://weixin.sogou.com/"
 DEFAULT_OUT = os.path.expanduser("~/Library/Application Support/readdaily/wechat-articles")
-DOWNLOADER = os.path.expanduser(
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))))
+BUNDLED_DOWNLOADER = os.path.join(
+    REPO_ROOT, "third_party", "wechat-article-pdf", "scripts", "download_article.py")
+EXTERNAL_DOWNLOADER = os.path.expanduser(
     "~/.agents/skills/wechat-article-pdf/scripts/download_article.py")
+DOWNLOADER = (
+    os.environ.get("READDAILY_WECHAT_DOWNLOADER")
+    or (BUNDLED_DOWNLOADER if os.path.isfile(BUNDLED_DOWNLOADER) else EXTERNAL_DOWNLOADER)
+)
 DAILY_LOG = os.path.join(DEFAULT_OUT, "_dailylog.jsonl")
 
 # ---- 电子报（参考案例格式） ----
@@ -261,6 +269,11 @@ def already_done(out_dir, d):
 
 def run_downloader(page_html, src11, out_dir):
     """调用 download_article.py --from-html；返回 (ok, 摘要文本)。"""
+    if not os.path.isfile(DOWNLOADER):
+        return False, (
+            "缺少微信文章下载器；请设置 READDAILY_WECHAT_DOWNLOADER，"
+            "或安装 wechat-article-pdf Skill。"
+        )
     cmd = [sys.executable, DOWNLOADER, "--from-html", page_html,
            "--source-url", src11, "-o", out_dir]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
@@ -285,7 +298,8 @@ def verify_artifacts(out_dir, d):
     html_f = pdf[:-4] + "_原文.html"
     meta = {}
     if os.path.exists(js):
-        meta = json.load(open(js, encoding="utf-8"))
+        with open(js, encoding="utf-8") as stream:
+            meta = json.load(stream)
     return {
         "pdf": os.path.basename(pdf),
         "md": os.path.basename(md) if os.path.exists(md) else None,
@@ -294,6 +308,7 @@ def verify_artifacts(out_dir, d):
         "images_complete": meta.get("images_complete"),
         "images_downloaded": meta.get("images_downloaded"),
         "title": meta.get("title"),
+        "publish_date": meta.get("publish_date"),
         "publish_time_full": meta.get("publish_time_full"),
     }
 
@@ -341,7 +356,8 @@ def parse_guide_and_pages(html_path):
     导读 = 两列表格（版号 15% + 栏目/标题 85%）：短文本=栏目名直接用作版名；
     长文本（头条标题）在 1/2 版用默认版名（要闻/综合新闻），其余版截取前 12 字。
     """
-    h = open(html_path, encoding="utf-8").read()
+    with open(html_path, encoding="utf-8") as stream:
+        h = stream.read()
     g = h.find("各版导读")
     seg = h[g:] if g >= 0 else h
     rows, pos = [], 0
@@ -371,11 +387,13 @@ def parse_guide_and_pages(html_path):
     if m_end < 0:
         m_end = len(seg)
     page_srcs = re.findall(r'<img\s+src="(assets/[^"]+\.(?:jpg|jpeg|png|webp))"', seg[:m_end])
-    if not rows or not page_srcs:
-        return rows, page_srcs
-    if len(page_srcs) < len(rows):
-        rows = rows[:len(page_srcs)]
-    return rows, page_srcs[:len(rows)]
+    if len(page_srcs) != len(rows):
+        raise ValueError(
+            "导读版次与版面图数量不一致 rows=%s imgs=%s" % (
+                len(rows), len(page_srcs)
+            )
+        )
+    return rows, page_srcs
 
 
 def ocr_issue_number(img_path):
@@ -392,14 +410,12 @@ def ocr_issue_number(img_path):
     if m:
         return m.group(1)
     try:
-        from PIL import Image
-        im = Image.open(img_path)
-        w, h = im.size
-        band = im.crop((0, int(h * 0.08), w, int(h * 0.20)))
-        band = band.resize((w * 2, int(h * 0.12) * 2), Image.LANCZOS)
-        band_path = os.path.join(tempfile.gettempdir(), "_cjsb_ocr_band.png")
-        band.save(band_path)
-        p = subprocess.run([VOCR, band_path], capture_output=True, text=True, timeout=120)
+        p = subprocess.run(
+            [VOCR, img_path, "--crop-top", "0.22"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
         m = re.search(r"第(\d{3,5})期", p.stdout)
         return m.group(1) if m else None
     except Exception:  # noqa: BLE001
@@ -453,7 +469,10 @@ def generate_epaper(out_dir, d, force=False):
     html_path = find_article_html(out_dir, d)
     if not html_path:
         return {"status": "no_source", "note": "未找到当天文章的 原文.html"}
-    rows, page_srcs = parse_guide_and_pages(html_path)
+    try:
+        rows, page_srcs = parse_guide_and_pages(html_path)
+    except ValueError as exc:
+        return {"status": "parse_failed", "note": str(exc)}
     if not rows or not page_srcs:
         return {"status": "parse_failed", "note": f"导读/版面图解析失败 rows={len(rows)} imgs={len(page_srcs)}"}
 
@@ -465,7 +484,6 @@ def generate_epaper(out_dir, d, force=False):
                 "pdf": os.path.basename(existing[-1]) if existing else None}
 
     import shutil
-    from PIL import Image
     hd = os.path.join(ep_dir, "高清热图")
     os.makedirs(hd, exist_ok=True)
     asset_dir = os.path.join(out_dir, ACCOUNT, "assets")
@@ -477,12 +495,23 @@ def generate_epaper(out_dir, d, force=False):
             src_path = os.path.join(asset_dir, os.path.basename(src))
         if not os.path.exists(src_path):
             return {"status": "asset_missing", "note": f"缺图 {src}"}
-        im = Image.open(src_path)
-        w, hh = im.size
-        if w != EP_WIDTH:
-            im = im.resize((EP_WIDTH, round(hh * EP_WIDTH / w)), Image.LANCZOS)
         fname = f"{n}版_{name}.jpg"
-        im.save(os.path.join(hd, fname), "JPEG", quality=EP_QUALITY)
+        output_path = os.path.join(hd, fname)
+        sips = "/usr/bin/sips"
+        if not os.path.isfile(sips):
+            return {"status": "image_tool_missing", "note": "缺少 macOS sips 图片转换工具"}
+        converted = subprocess.run(
+            [sips, "--resampleWidth", str(EP_WIDTH),
+             "--setProperty", "format", "jpeg",
+             "--setProperty", "formatOptions", str(EP_QUALITY),
+             src_path, "--out", output_path],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if converted.returncode != 0 or not os.path.isfile(output_path):
+            detail = (converted.stderr or converted.stdout or "").strip()[-500:]
+            return {"status": "image_convert_failed", "note": f"版面图转换失败：{detail}"}
         files.append(fname)
 
     # 期号 OCR（命名《中国建设报》YYYY-MM-DD_第XXXX期_电子报_高清.pdf）
