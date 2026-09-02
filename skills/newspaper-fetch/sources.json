@@ -141,18 +141,19 @@
    "name": "北京日报",
    "type": "地方党报",
    "publish": "daily",
-   "channel": "founder",
-   "entry": "https://bjrb.bjd.com.cn/",
-   "patterns": [
-    "http://bjrb.bjd.com.cn/bjrb/html/{y}-{m}/{d}/nbs.D110000bjrb_{page:02d}.htm",
-    "https://bjrb.bjd.com.cn/bjrb/pc/layout/{y}/{m}/{d}/node_{page:02d}.html"
-   ],
-   "enabled": false,
+   "channel": "mobile_epaper",
+   "entry": "https://bjrbdzb.bjd.com.cn/",
+   "enabled": true,
    "priority": 7,
-   "status": "blocked",
-   "note": "❌ 数字报并入门户(全302)；京报网仅「版面速览」视频(MP4)；官网新闻流可用；等官方重启数字报或抽帧OCR专项",
+   "status": "confirmed",
+   "note": "✅ 破解：数字报专用域 bjrbdzb.bjd.com.cn（paperindex→当日_m.html）；内嵌版次/文章全文(id=content)/版面图；2026-09-02 实证",
    "anti": {
     "rate_s": 4
+   },
+   "mob": {
+    "index_tpl": "https://bjrbdzb.bjd.com.cn/bjrb/mobile/{y}/{yymmdd}/{yymmdd}_m.html",
+    "site": "https://bjrbdzb.bjd.com.cn/",
+    "max_pages": 24
    }
   },
   {
@@ -184,8 +185,8 @@
    ],
    "enabled": false,
    "priority": 9,
-   "status": "blocked",
-   "note": "❌ 已确认订阅制付费墙(help页明文：需登录购买/注册账号/暂不提供历史数据购买)；红线不绕过→需用户决策(付费订阅/放弃/官网新闻流)",
+   "status": "dropped",
+   "note": "🚫 2026-09-02 用户决策移除：订阅制付费墙（help页明文），按红线不绕过",
    "anti": {
     "rate_s": 5,
     "chrome_fallback": true

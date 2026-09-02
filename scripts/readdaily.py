@@ -27,6 +27,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FETCHER = os.path.join(REPO, "skills", "newspaper-fetch", "scripts", "fetch.py")
 READER = os.path.join(REPO, "skills", "newspaper-reader", "scripts", "reader.py")
+WORKBENCH_API = os.path.join(
+    REPO, "skills", "newspaper-reader", "scripts", "workbench_api.py")
 REGISTRY = os.path.join(REPO, "skills", "newspaper-fetch", "sources.json")
 ARCHIVE = os.environ.get("READDAILY_ARCHIVE") or os.path.expanduser(
     "~/Library/Application Support/readdaily/news-archive")
@@ -41,7 +43,7 @@ def run(script, *args):
 
 
 def cmd_fetch(args):
-    cmd = [FETCHER]
+    cmd = [sys.executable, FETCHER, "--registry", REGISTRY]
     if args.date:
         cmd += ["--date", args.date]
     if args.source:
@@ -54,7 +56,7 @@ def cmd_fetch(args):
 
 
 def cmd_reader(args):
-    return run(READER, args.cmd2, *(["--date", args.date] if args.date else []),
+    return run(READER, args.cmd, *(["--date", args.date] if args.date else []),
                *(["--entity", args.entity] if args.entity else []))
 
 
@@ -120,6 +122,10 @@ def cmd_query(args):
 
 
 def main():
+    # Keep the workbench API parser independent so native clients can pass new
+    # versioned flags without coupling them to this legacy CLI parser.
+    if len(sys.argv) > 1 and sys.argv[1] == "api":
+        sys.exit(run(WORKBENCH_API, *sys.argv[2:]))
     ap = argparse.ArgumentParser(description="readdaily CLI")
     ap.add_argument("cmd", choices=["fetch", "prepare", "ingest", "archive", "digest",
                                     "tracking", "query", "status", "all"])

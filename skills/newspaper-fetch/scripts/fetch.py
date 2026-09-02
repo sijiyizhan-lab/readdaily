@@ -20,7 +20,6 @@ sys.path.insert(0, HERE)
 import lib  # noqa: E402
 
 REGISTRY = os.path.expanduser("~/.agents/skills/newspaper-fetch/sources.json")
-DAILY_LOG = os.path.expanduser("~/Library/Application Support/readdaily/news-archive/_dailylog.jsonl")
 
 
 def load_registry(path=REGISTRY):
@@ -28,6 +27,14 @@ def load_registry(path=REGISTRY):
     if not reg:
         sys.exit("注册表缺失")
     return reg
+
+
+def resolve_archive_root(registry):
+    """Use the caller-selected archive before the registry's installation default."""
+    configured = os.environ.get("READDAILY_ARCHIVE") or registry.get(
+        "archive_root", "~/Library/Application Support/readdaily/news-archive"
+    )
+    return os.path.expanduser(configured)
 
 
 def load_adapter(channel):
@@ -47,7 +54,8 @@ def main():
     args = ap.parse_args()
 
     reg = load_registry(args.registry)
-    root = os.path.expanduser(reg.get("archive_root", "~/Downloads/news-archive"))
+    root = resolve_archive_root(reg)
+    daily_log = os.path.join(root, "_dailylog.jsonl")
     d = lib.norm_day(args.date or datetime.date.today())
     want = [s for s in reg["sources"]
             if (args.source and s["id"] in args.source.split(",")) or (not args.source and s.get("enabled"))]
@@ -91,7 +99,7 @@ def main():
                 ok, chain = lib.chain_check(root, sid, d, issue.get("issue_no"))
                 print("  fetch ok;", "👍" if ok else "⚠️", chain)
                 st = lib.state_mark(aps["state"], "fetched", edition_no=len(issue.get("editions", [])))
-                lib.log_line(os.path.expanduser(DAILY_LOG), {
+                lib.log_line(daily_log, {
                     "source": sid, "source_name": src["name"], "date": d.isoformat(),
                     "stage": "fetched", "editions": len(issue.get("editions", [])),
                     "issue_no": issue.get("issue_no"), "chain_ok": ok,
@@ -107,7 +115,7 @@ def main():
                 continue
             n = len(issue.get("units", []))
             lib.state_mark(aps["state"], "parsed", units=n)
-            lib.log_line(os.path.expanduser(DAILY_LOG), {
+            lib.log_line(daily_log, {
                 "source": sid, "source_name": src["name"], "date": d.isoformat(),
                 "stage": "parsed", "units": n, "issue_json": aps["issue_json"]})
             print("  parsed ok:", n, "units")

@@ -4,3 +4,5 @@ __pycache__/
 skills/newspaper-fetch/bin/vocr
 *.log
 .keep
+apps/ConstructionReadingDesk/.build/
+dist/

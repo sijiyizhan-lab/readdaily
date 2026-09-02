@@ -1,8 +1,8 @@
 # readdaily — 多报每日读报系统（全自动抓取 → LLM 归纳 → Obsidian）
 
-把【每日报纸（人民日报/光明日报/经济日报/科技日报/中国建设报/农民日报/南方日报…）】自动抓成结构化全文，
+把【每日报纸（人民日报/光明日报/经济日报/科技日报/中国建设报/农民日报/南方日报/北京日报…）】自动抓成结构化全文，
 由 Agent/LLM 归纳出**栏目分类+摘要+实体+重要性**，归档到 Obsidian（报纸原文/每日摘要/主体档案/看板），
-并支持**主题检索与主体时间线跟踪**。已在 2026-09-02 以 7 家报纸实测：343 文章单位 / 619K 字当日入库。
+并支持**主题检索与主体时间线跟踪**。已在 2026-09-02 以 8 家报纸实测：99 归纳条目 / 约 700K 字当日入库。
 
 > 版权声明：下载内容版权归各报社。本项目仅提供**公开内容**的个人阅读/研究自动化，禁止商用转发。
 > 边界承诺：不绕过验证码/登录/付费墙（按订阅源处理时需用户授权）。
@@ -10,7 +10,7 @@
 ## 快速开始（macOS）
 
 ```bash
-git clone https://github.com/<you>/readdaily.git && cd readdaily
+git clone https://github.com/sijiyizhan-lab/readdaily.git && cd readdaily
 ./install.sh                      # 技能软链（Codex/Claude/通用 Agent）→ OCR 构建 → launchd → 数据/Vault 初始化
 python3 scripts/readdaily.py status       # 看状态
 python3 scripts/readdaily.py query "城市更新"   # 主题检索（当日演示）
@@ -19,6 +19,17 @@ python3 scripts/readdaily.py query "城市更新"   # 主题检索（当日演�
 安装后：
 - **每日 10:25 / 20:00 自动抓取** 7 家报纸（launchd；非 macOS 用 cron，见 install.sh 输出）
 - 在你常用的 Agent/Codex 里说「读报」→ 按 read-daily 技能执行归纳→Obsidian→跟踪
+
+## 建设读报台（原生 macOS 应用）
+
+仓库内含一个面向「中国建设报 → 中文知识卡片」的 SwiftUI 人工复核工作台：可添加或拖入 PDF、对照原版与 OCR、编辑摘要/主题/事实字段、预览 Markdown 差异，并在发布后按事务回滚。
+
+```bash
+./scripts/build_macos_app.sh
+open "dist/建设读报台.app"
+```
+
+应用默认连接 `~/readdaily`、本地报纸归档和 `~/Maitty的知识库`，均可在设置中修改。「保存草稿」只写归档目录；只有「预览发布 → 确认发布」会写入 Vault 下的 `09-建设新闻与报纸摘要`，且会保留人工内容、检测冲突并创建回滚快照。详见 [应用说明](apps/ConstructionReadingDesk/README.md)。
 
 ## 架构一览（单仓库、零服务依赖）
 
@@ -30,6 +41,8 @@ sources.json（注册表：渠道类型/入口/启用状态）
        ├─ paper_api    JSON-API 数字报（科技日报型，匿名 uv/* 接口）
        └─ cms_index    index.json 型（农民日报，显式文件路径绕过 WAF 目录封禁）
   └─ reader.py（归纳流水线）→ _summaries schema → Obsidian（报纸原文/每日摘要/主体档案/看板）
+  └─ workbench_api.py（版本化 JSON 接口）→ 草稿/发布预览/事务回滚
+       └─ ConstructionReadingDesk（SwiftUI 本地复核客户端）
   └─ readdaily.py CLI（fetch/status/query/tracking/ingest/archive/digest）
 ```
 
@@ -59,6 +72,7 @@ python3 scripts/readdaily.py all            # 抓取+归纳+归档+摘要+跟踪
 | `readdaily prepare/ingest/archive/digest` | 归纳流水线（配合 Agent/LLM） |
 | `readdaily tracking --entity 城市更新` | 主体档案追加时间线 |
 | `readdaily query "城市更新" --days 2` | 跨源全文检索（证据式读报答案） |
+| `readdaily api capabilities` | 工作台 JSON 接口能力与路径检查 |
 
 ## 给 Codex / Claude Code / 任意 Agent
 
