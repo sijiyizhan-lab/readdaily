@@ -1,0 +1,16 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - name: 语法与注册表校验
+        run: |
+          python3 -m py_compile skills/newspaper-fetch/scripts/*.py \
+                       skills/newspaper-fetch/scripts/adapters/*.py \
+                       skills/newspaper-reader/scripts/*.py scripts/readdaily.py
+          python3 -c "import json;json.load(open('skills/newspaper-fetch/sources.json'))"
+          echo OK

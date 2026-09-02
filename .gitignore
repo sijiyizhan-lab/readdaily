@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.DS_Store
+skills/newspaper-fetch/bin/vocr
+*.log
+.keep

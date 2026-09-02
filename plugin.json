@@ -1,0 +1,10 @@
+{
+  "name": "readdaily",
+  "version": "0.1.0",
+  "description": "多报每日读报：公开报纸每日自动抓取+LLM 归纳+Obsidian 归档+主题跟踪（Codex/Claude/通用 Agent 技能包）",
+  "homepage": "https://github.com/yourname/readdaily",
+  "platforms": ["codex", "claude", "agents", "workbuddy"],
+  "skills": ["newspaper-fetch", "newspaper-reader", "read-daily"],
+  "entry": "./install.sh",
+  "requirements": ["python3", "(macOS+swiftc: 微信渠道/OCR)"]
+}

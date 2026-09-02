@@ -1,0 +1,195 @@
+{
+ "schema_version": 1,
+ "updated": "2026-09-02",
+ "archive_root": "/Users/guopeijun/Library/Application Support/readdaily/news-archive",
+ "sources": [
+  {
+   "id": "zgjsb",
+   "name": "中国建设报",
+   "type": "中央部委/行业报",
+   "publish": "daily",
+   "channel": "wechat_read",
+   "account": {
+    "biz": "MzA4MDQ2NDYxNg==",
+    "title_prefix": "读报",
+    "publish_around": "10:08"
+   },
+   "enabled": true,
+   "priority": 1,
+   "status": "done",
+   "note": "微信读报渠道，已全链路试点（9167→9168→9169 期号连续）",
+   "anti": {
+    "rate_s": 3
+   },
+   "out": "/Users/guopeijun/Library/Application Support/readdaily/wechat-articles"
+  },
+  {
+   "id": "rmrb",
+   "name": "人民日报",
+   "type": "中央党报",
+   "publish": "daily",
+   "channel": "founder",
+   "entry": "https://paper.people.com.cn/rmrb/",
+   "patterns": [
+    "https://paper.people.com.cn/rmrb/html/{y}-{m}/{d}/nbs.D110000renmrb_{page:02d}.htm",
+    "https://paper.people.com.cn/rmrb/pc/layout/{y}/{m}/{d}/node_{page:02d}.html"
+   ],
+   "enabled": true,
+   "priority": 2,
+   "status": "confirmed",
+   "note": "✅ 8版全文+4.1MB版面原图（pc/layout/pc/pic），2026-09-02 实测",
+   "anti": {
+    "rate_s": 5,
+    "chrome_fallback": true
+   },
+   "node_tpl": "https://paper.people.com.cn/rmrb/pc/layout/{y}{m}/{d}/node_{page:02d}.html",
+   "pic_tpls": [
+    "https://paper.people.com.cn/rmrb/pc/pic/{y}{m}/{d}/{name}.jpg"
+   ],
+   "max_pages": 14
+  },
+  {
+   "id": "gmrb",
+   "name": "光明日报",
+   "type": "中央党报",
+   "publish": "daily",
+   "channel": "founder",
+   "entry": "http://epaper.gmw.cn/",
+   "patterns": [
+    "http://epaper.gmw.cn/gmrb/html/{y}-{m}/{d}/nbs.D110000gmrb_{page:02d}.htm",
+    "http://epaper.gmw.cn/gmrb/pc/layout/{y}/{m}/{d}/node_{page:02d}.html"
+   ],
+   "enabled": true,
+   "priority": 3,
+   "status": "confirmed",
+   "note": "✅ 入口 index.html 发现当日15+版；2026-09-02 实测",
+   "anti": {
+    "rate_s": 4
+   },
+   "node_tpl": "http://epaper.gmw.cn/gmrb/html/layout/{y}{m}/{d}/node_{page:02d}.html",
+   "max_pages": 20,
+   "index_url": "http://epaper.gmw.cn/gmrb/html/layout/index.html"
+  },
+  {
+   "id": "kjrb",
+   "name": "科技日报",
+   "type": "中央部委/行业报",
+   "publish": "daily",
+   "channel": "paper_api",
+   "entry": "https://epaper.stdaily.com/",
+   "patterns": [
+    "https://digitalpaper.stdaily.com/kjrb/html/{y}-{m}/{d}/nbs.D110000kjrb_{page:02d}.htm",
+    "https://digitalpaper.stdaily.com/kjrb/pc/layout/{y}/{m}/{d}/node_{page:02d}.html",
+    "https://digitalpaper.stdaily.com/pc/layout/{y}/{m}/{d}/node_{page:02d}.html"
+   ],
+   "enabled": true,
+   "priority": 4,
+   "status": "confirmed",
+   "note": "✅ 匿名API破解：uv/article/period/date → periodTime → editionId(含全文)；2026-09-02 实测",
+   "anti": {
+    "rate_s": 4
+   },
+   "api": {
+    "base": "https://epaper.stdaily.com/stdailynewspaperapi",
+    "code": "KJRB"
+   }
+  },
+  {
+   "id": "jjrb",
+   "name": "经济日报",
+   "type": "中央党报",
+   "publish": "daily",
+   "channel": "founder",
+   "entry": "https://paper.ce.cn/",
+   "patterns": [
+    "http://paper.ce.cn/pc/layout/{y}/{m}/{d}/node_{page:02d}.html",
+    "http://paper.ce.cn/html/{y}-{m}/{d}/nbs.D110000jjrb_{page:02d}.htm"
+   ],
+   "enabled": true,
+   "priority": 5,
+   "status": "confirmed",
+   "note": "✅ 2026-09-02 实测 4版（首页偶发504，重试即可）",
+   "anti": {
+    "rate_s": 5
+   },
+   "node_tpl": "http://paper.ce.cn/pc/layout/{y}{m}/{d}/node_{page:02d}.html",
+   "max_pages": 12
+  },
+  {
+   "id": "nmrb",
+   "name": "农民日报",
+   "type": "中央部委/行业报",
+   "publish": "daily",
+   "channel": "cms_index",
+   "entry": "https://szb.farmer.com.cn/",
+   "enabled": true,
+   "priority": 6,
+   "status": "confirmed",
+   "note": "✅ index.json 破解：当日最新期+版次+文章直链（ozoom 全文），显式路径绕过 WAF；2026-09-02 第13394期 10版",
+   "anti": {
+    "rate_s": 4
+   },
+   "cms": {
+    "index_json": "https://szb.farmer.com.cn/index.json",
+    "site": "https://szb.farmer.com.cn/",
+    "paper_code": "nmrb",
+    "max_pages": 16
+   }
+  },
+  {
+   "id": "bjrb",
+   "name": "北京日报",
+   "type": "地方党报",
+   "publish": "daily",
+   "channel": "founder",
+   "entry": "https://bjrb.bjd.com.cn/",
+   "patterns": [
+    "http://bjrb.bjd.com.cn/bjrb/html/{y}-{m}/{d}/nbs.D110000bjrb_{page:02d}.htm",
+    "https://bjrb.bjd.com.cn/bjrb/pc/layout/{y}/{m}/{d}/node_{page:02d}.html"
+   ],
+   "enabled": false,
+   "priority": 7,
+   "status": "blocked",
+   "note": "❌ 数字报并入门户(全302)；京报网仅「版面速览」视频(MP4)；官网新闻流可用；等官方重启数字报或抽帧OCR专项",
+   "anti": {
+    "rate_s": 4
+   }
+  },
+  {
+   "id": "nfrb",
+   "name": "南方日报",
+   "type": "地方党报",
+   "publish": "daily",
+   "channel": "founder",
+   "entry": "https://epaper.nfnews.com/",
+   "enabled": true,
+   "priority": 8,
+   "status": "confirmed",
+   "note": "✅ epaper.nfnews.com frameset→nfdaily/html/index.html→node页layoutData(版图URL+文章+150字摘要)→content页全文；2026-09-02 24版128K字",
+   "anti": {
+    "rate_s": 4
+   },
+   "index_url": "https://epaper.nfnews.com/nfdaily/html/index.html",
+   "max_pages": 24
+  },
+  {
+   "id": "hqsb",
+   "name": "环球时报",
+   "type": "市场化/时政",
+   "publish": "daily",
+   "channel": "pdf_site",
+   "entry": "https://paper.huanqiu.com/",
+   "patterns": [
+    "https://paper.huanqiu.com/"
+   ],
+   "enabled": false,
+   "priority": 9,
+   "status": "blocked",
+   "note": "❌ 已确认订阅制付费墙(help页明文：需登录购买/注册账号/暂不提供历史数据购买)；红线不绕过→需用户决策(付费订阅/放弃/官网新闻流)",
+   "anti": {
+    "rate_s": 5,
+    "chrome_fallback": true
+   }
+  }
+ ]
+}
