@@ -14,10 +14,10 @@ struct ConstructionReadingDeskApp: App {
     var body: some Scene {
         WindowGroup("建设读报台") {
             ReadingDeskRootView(settings: settings, viewModel: viewModel)
-                .frame(minWidth: 1120, minHeight: 720)
+                .frame(minWidth: 1240, minHeight: 760)
         }
         .windowStyle(.titleBar)
-        .windowToolbarStyle(.unified(showsTitle: true))
+        .windowToolbarStyle(.unifiedCompact(showsTitle: true))
         .commands {
             CommandGroup(after: .newItem) {
                 Button("添加 PDF…") { NotificationCenter.default.post(name: .readingDeskImportPDF, object: nil) }

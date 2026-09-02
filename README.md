@@ -1,5 +1,7 @@
 # readdaily — 多报每日读报系统（全自动抓取 → LLM 归纳 → Obsidian）
 
+<p align="center"><img src="assets/logo/readdaily-lockup.png" alt="ReadDaily 读报" width="560"></p>
+
 把【每日报纸（人民日报/光明日报/经济日报/科技日报/中国建设报/农民日报/南方日报/北京日报…）】自动抓成结构化全文，
 由 Agent/LLM 归纳出**栏目分类+摘要+实体+重要性**，归档到 Obsidian（报纸原文/每日摘要/主体档案/看板），
 并支持**主题检索与主体时间线跟踪**。已在 2026-09-02 以 8 家报纸实测：99 归纳条目 / 约 700K 字当日入库。

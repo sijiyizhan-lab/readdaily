@@ -14,18 +14,22 @@ struct ReadingDeskRootView: View {
     var body: some View {
         NavigationSplitView {
             InboxSidebar(viewModel: viewModel)
-                .navigationSplitViewColumnWidth(min: 240, ideal: 286, max: 360)
+                .navigationSplitViewColumnWidth(min: 250, ideal: 300, max: 370)
         } content: {
             EditionColumn(viewModel: viewModel)
-                .navigationSplitViewColumnWidth(min: 245, ideal: 300, max: 390)
+                .navigationSplitViewColumnWidth(min: 270, ideal: 320, max: 410)
         } detail: {
             ReviewEditor(viewModel: viewModel)
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(ReadingDeskBackground())
         .overlay {
             if isDropTarget {
                 RoundedRectangle(cornerRadius: 16)
-                    .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 3, dash: [10]))
+                    .fill(ReadingDeskTheme.accentSoft.opacity(0.22))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 16)
+                            .stroke(ReadingDeskTheme.accent, style: StrokeStyle(lineWidth: 3, dash: [10]))
+                    }
                     .padding(14)
                     .allowsHitTesting(false)
                     .accessibilityHidden(true)
@@ -111,29 +115,31 @@ struct ReadingDeskRootView: View {
             Button { viewModel.refresh() } label: {
                 Label("刷新", systemImage: "arrow.clockwise")
             }
+            .labelStyle(.iconOnly)
             .disabled(viewModel.isBusy)
             .help("刷新收件箱（⌘R）")
             .accessibilityLabel("刷新收件箱")
 
-            Button { isImporting = true } label: {
-                Label("添加 PDF", systemImage: "plus.rectangle.on.folder")
+            Menu {
+                Button { isImporting = true } label: {
+                    Label("添加 PDF…", systemImage: "plus.rectangle.on.folder")
+                }
+                Button { viewModel.fetchConstructionPaper() } label: {
+                    Label("抓取中国建设报", systemImage: "arrow.down.doc")
+                }
+            } label: {
+                Label("导入报纸", systemImage: "tray.and.arrow.down")
             }
             .disabled(viewModel.isBusy)
-            .help("添加 PDF（⌘O），也可拖入窗口")
-            .accessibilityLabel("添加报纸 PDF")
-
-            Button { viewModel.fetchConstructionPaper() } label: {
-                Label("抓取中国建设报", systemImage: "arrow.down.doc")
-            }
-            .disabled(viewModel.isBusy)
-            .help("从已配置的公开渠道抓取中国建设报")
-            .accessibilityLabel("抓取中国建设报")
+            .help("添加 PDF 或抓取中国建设报")
+            .accessibilityLabel("导入报纸")
 
             Divider()
 
             Button { viewModel.saveDraft() } label: {
                 Label("保存草稿", systemImage: viewModel.hasUnsavedChanges ? "square.and.arrow.down.fill" : "square.and.arrow.down")
             }
+            .labelStyle(.iconOnly)
             .disabled(viewModel.isBusy || viewModel.issueDetail == nil)
             .help("保存整期草稿（⌘S），不会写入 Obsidian")
             .accessibilityLabel("保存整期草稿")
@@ -141,25 +147,25 @@ struct ReadingDeskRootView: View {
             Button { viewModel.previewPublish() } label: {
                 Label("预览发布", systemImage: "doc.text.magnifyingglass")
             }
+            .buttonStyle(.borderedProminent)
+            .tint(ReadingDeskTheme.accent)
             .disabled(viewModel.isBusy || viewModel.issueDetail == nil)
             .help("先查看文件清单与差异，再确认发布")
             .accessibilityLabel("预览发布")
 
-            Button {
-                showHistory = true
+            Menu {
+                Button { showHistory = true } label: {
+                    Label("发布历史", systemImage: "clock.arrow.circlepath")
+                }
+                Button { showSettings = true } label: {
+                    Label("设置", systemImage: "gearshape")
+                }
             } label: {
-                Label("发布历史", systemImage: "clock.arrow.circlepath")
+                Label("更多", systemImage: "ellipsis.circle")
             }
             .disabled(viewModel.isBusy)
-            .help("查看发布历史与回滚")
-            .accessibilityLabel("查看发布历史")
-
-            Button { showSettings = true } label: {
-                Label("设置", systemImage: "gearshape")
-            }
-            .disabled(viewModel.isBusy)
-            .help("设置仓库、归档与知识库路径")
-            .accessibilityLabel("打开设置")
+            .help("发布历史与设置")
+            .accessibilityLabel("更多操作")
         }
     }
 
@@ -195,64 +201,120 @@ private struct InboxSidebar: View {
     @ObservedObject var viewModel: ReadingDeskViewModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("建设读报台")
-                    .font(.title2.weight(.bold))
-                Text("本地复核 · 证据可追溯")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            .padding(16)
+        ZStack {
+            ReadingDeskBackground()
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 11) {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(
+                                LinearGradient(
+                                    colors: [ReadingDeskTheme.accent, ReadingDeskTheme.bannerEnd],
+                                    startPoint: .topLeading,
+                                    endPoint: .bottomTrailing
+                                )
+                            )
+                        Image(systemName: "building.2.fill")
+                            .font(.system(size: 18, weight: .semibold))
+                            .foregroundStyle(.white)
+                    }
+                    .frame(width: 42, height: 42)
+                    .accessibilityHidden(true)
 
-            List(selection: Binding(
-                get: { viewModel.selectedIssueID },
-                set: { viewModel.selectIssue($0) }
-            )) {
-                Section("报纸收件箱") {
-                    if viewModel.issues.isEmpty && !viewModel.isBusy {
-                        EmptyRow(
-                            title: "暂无报纸",
-                            detail: "添加 PDF 或抓取中国建设报",
-                            symbol: "tray"
-                        )
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("建设读报台")
+                            .font(.headline.weight(.bold))
+                        Text("本地复核 · 证据可追溯")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
-                    ForEach(viewModel.issues) { issue in
-                        InboxRow(issue: issue)
-                            .tag(Optional(issue.stableID))
-                    }
+                    Spacer(minLength: 4)
+                    Text("\(viewModel.issues.count)")
+                        .font(.caption.monospacedDigit().weight(.semibold))
+                        .foregroundStyle(ReadingDeskTheme.accent)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(ReadingDeskTheme.accentSoft, in: Capsule())
                 }
+                .readingDeskCard(padding: 12)
+                .accessibilityElement(children: .combine)
 
-                if !viewModel.allWarnings.isEmpty {
-                    Section("质量告警") {
-                        ForEach(Array(viewModel.allWarnings.prefix(8).enumerated()), id: \.offset) { _, warning in
-                            Label(warning, systemImage: "exclamationmark.triangle.fill")
-                                .font(.caption)
-                                .foregroundStyle(.orange)
-                                .accessibilityLabel("质量告警：\(warning)")
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 9) {
+                        ReadingDeskSectionTitle(
+                            title: "报纸收件箱",
+                            systemImage: "tray.full",
+                            count: viewModel.issues.count
+                        )
+                        .padding(.horizontal, 4)
+
+                        if viewModel.issues.isEmpty && !viewModel.isBusy {
+                            EmptyRow(
+                                title: "暂无报纸",
+                                detail: "添加 PDF 或抓取中国建设报",
+                                symbol: "tray"
+                            )
+                            .readingDeskCard(padding: 12, cool: true)
+                        }
+
+                        ForEach(viewModel.issues) { issue in
+                            Button {
+                                viewModel.selectIssue(issue.stableID)
+                            } label: {
+                                InboxRow(
+                                    issue: issue,
+                                    isSelected: viewModel.selectedIssueID == issue.stableID
+                                )
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityValue(viewModel.selectedIssueID == issue.stableID ? "已选择" : "未选择")
+                        }
+
+                        if !viewModel.allWarnings.isEmpty {
+                            ReadingDeskSectionTitle(
+                                title: "质量告警",
+                                systemImage: "exclamationmark.triangle.fill",
+                                count: viewModel.allWarnings.count
+                            )
+                            .padding(.horizontal, 4)
+                            .padding(.top, 10)
+
+                            ForEach(Array(viewModel.allWarnings.prefix(8).enumerated()), id: \.offset) { _, warning in
+                                HStack(alignment: .top, spacing: 8) {
+                                    Image(systemName: "exclamationmark.triangle.fill")
+                                        .foregroundStyle(.orange)
+                                    Text(warning)
+                                        .foregroundStyle(.primary)
+                                }
+                                    .font(.caption)
+                                    .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                                    .readingDeskCard(padding: 10, cool: true)
+                                    .accessibilityLabel("质量告警：\(warning)")
+                            }
                         }
                     }
+                    .padding(.bottom, 8)
                 }
-            }
-            .listStyle(.sidebar)
 
-            if viewModel.isBusy {
-                HStack(spacing: 10) {
-                    ProgressView()
-                    Text(viewModel.operationTitle)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                if viewModel.isBusy {
+                    HStack(spacing: 10) {
+                        ProgressView().controlSize(.small)
+                        Text(viewModel.operationTitle)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                    .readingDeskCard(padding: 10, cool: true)
                 }
-                .padding(14)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(.bar)
             }
+            .padding(12)
         }
     }
 }
 
 private struct InboxRow: View {
     let issue: IssueSummary
+    let isSelected: Bool
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
@@ -283,10 +345,29 @@ private struct InboxRow: View {
                     .padding(.horizontal, 7)
                     .padding(.vertical, 2)
                     .background(stageColor.opacity(0.14), in: Capsule())
-                    .foregroundStyle(stageColor)
+                    .foregroundStyle(.primary)
             }
         }
-        .padding(.vertical, 5)
+        .padding(11)
+        .frame(maxWidth: .infinity, minHeight: 72, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                .fill(isSelected ? ReadingDeskTheme.accentSoft : ReadingDeskTheme.card)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                .stroke(isSelected ? ReadingDeskTheme.accent : ReadingDeskTheme.border, lineWidth: isSelected ? 1.5 : 1)
+        }
+        .overlay(alignment: .leading) {
+            if isSelected {
+                Capsule()
+                    .fill(ReadingDeskTheme.accent)
+                    .frame(width: 3)
+                    .padding(.vertical, 10)
+                    .accessibilityHidden(true)
+            }
+        }
+        .contentShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
         .accessibilityElement(children: .combine)
     }
 
@@ -314,39 +395,75 @@ private struct EditionColumn: View {
     @ObservedObject var viewModel: ReadingDeskViewModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            if let issue = viewModel.issueDetail {
-                VStack(alignment: .leading, spacing: 5) {
-                    Text(issue.sourceName)
-                        .font(.headline)
-                    Text([issue.date, issue.issueNumber.map { "第\($0)期" }].compactMap { $0 }.joined(separator: " · "))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                .padding(16)
-
-                List(selection: Binding(
-                    get: { viewModel.selectedEditionID },
-                    set: { viewModel.selectEdition($0) }
-                )) {
-                    Section("版次 · \(issue.editions.count)") {
-                        ForEach(issue.editions) { edition in
-                            EditionRow(
-                                edition: edition,
-                                isDirty: viewModel.dirtyUnitIDs.contains(edition.id)
-                            )
-                            .tag(Optional(edition.id))
+        ZStack {
+            ReadingDeskBackground()
+            VStack(alignment: .leading, spacing: 12) {
+                if let issue = viewModel.issueDetail {
+                    HStack(spacing: 11) {
+                        ZStack {
+                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .fill(ReadingDeskTheme.cardCool)
+                            Image(systemName: "newspaper.fill")
+                                .font(.title3)
+                                .foregroundStyle(ReadingDeskTheme.accent)
+                        }
+                        .frame(width: 42, height: 42)
+                        .accessibilityHidden(true)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(issue.sourceName)
+                                .font(.headline)
+                            Text([issue.date, issue.issueNumber.map { "第\($0)期" }].compactMap { $0 }.joined(separator: " · "))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 4)
+                        VStack(alignment: .trailing, spacing: 2) {
+                            Text("\(issue.editions.count)")
+                                .font(.title3.monospacedDigit().weight(.bold))
+                                .foregroundStyle(ReadingDeskTheme.accent)
+                            Text("个版次")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
                         }
                     }
+                    .readingDeskCard(padding: 12)
+                    .accessibilityElement(children: .combine)
+
+                    ReadingDeskSectionTitle(
+                        title: "版次",
+                        systemImage: "rectangle.stack",
+                        count: issue.editions.count
+                    )
+                    .padding(.horizontal, 4)
+
+                    ScrollView {
+                        LazyVStack(spacing: 9) {
+                            ForEach(issue.editions) { edition in
+                                Button {
+                                    viewModel.selectEdition(edition.id)
+                                } label: {
+                                    EditionRow(
+                                        edition: edition,
+                                        isDirty: viewModel.dirtyUnitIDs.contains(edition.id),
+                                        isSelected: viewModel.selectedEditionID == edition.id
+                                    )
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityValue(viewModel.selectedEditionID == edition.id ? "已选择" : "未选择")
+                            }
+                        }
+                        .padding(.bottom, 8)
+                    }
+                } else {
+                    EmptyState(
+                        title: "选择一期报纸",
+                        detail: "左侧显示已导入或已抓取的报纸。",
+                        symbol: "newspaper"
+                    )
+                    .readingDeskCard(cool: true)
                 }
-                .listStyle(.inset)
-            } else {
-                EmptyState(
-                    title: "选择一期报纸",
-                    detail: "左侧显示已导入或已抓取的报纸。",
-                    symbol: "newspaper"
-                )
             }
+            .padding(12)
         }
     }
 }
@@ -354,13 +471,18 @@ private struct EditionColumn: View {
 private struct EditionRow: View {
     let edition: EditionRecord
     let isDirty: Bool
+    let isSelected: Bool
 
     var body: some View {
         HStack(spacing: 10) {
             ZStack(alignment: .topTrailing) {
                 RoundedRectangle(cornerRadius: 6)
-                    .fill(Color(nsColor: .controlBackgroundColor))
-                    .frame(width: 42, height: 54)
+                    .fill(isSelected ? ReadingDeskTheme.card : ReadingDeskTheme.cardCool)
+                    .frame(width: 44, height: 56)
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 6)
+                            .stroke(ReadingDeskTheme.border)
+                    }
                     .overlay {
                         Image(systemName: edition.imagePath == nil ? "doc.text" : "photo")
                             .foregroundStyle(.secondary)
@@ -381,7 +503,26 @@ private struct EditionRow: View {
                     .foregroundStyle(.tertiary)
             }
         }
-        .padding(.vertical, 5)
+        .padding(11)
+        .frame(maxWidth: .infinity, minHeight: 76, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                .fill(isSelected ? ReadingDeskTheme.accentSoft : ReadingDeskTheme.card)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                .stroke(isSelected ? ReadingDeskTheme.accent : ReadingDeskTheme.border, lineWidth: isSelected ? 1.5 : 1)
+        }
+        .overlay(alignment: .leading) {
+            if isSelected {
+                Capsule()
+                    .fill(ReadingDeskTheme.accent)
+                    .frame(width: 3)
+                    .padding(.vertical, 10)
+                    .accessibilityHidden(true)
+            }
+        }
+        .contentShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
         .accessibilityElement(children: .combine)
     }
 }
@@ -437,7 +578,11 @@ private struct NoticeBanner: View {
         }
         .padding(.horizontal, 16)
         .frame(minHeight: 44)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
-        .shadow(radius: 8, y: 3)
+        .background(ReadingDeskTheme.card, in: RoundedRectangle(cornerRadius: 10))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(ReadingDeskTheme.border)
+        }
+        .shadow(color: .black.opacity(0.08), radius: 8, y: 3)
     }
 }

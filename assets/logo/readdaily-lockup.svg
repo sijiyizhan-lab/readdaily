@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 420" width="1600" height="420">
+  <defs>
+    <linearGradient id="bgGrad2" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#10243f"/>
+      <stop offset="1" stop-color="#1d4a7a"/>
+    </linearGradient>
+    <linearGradient id="sunGrad2" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffc46b"/>
+      <stop offset="1" stop-color="#ff6b35"/>
+    </linearGradient>
+    <linearGradient id="paperGrad2" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#eef2f6"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 图标（晨报之窗 · 小型化） -->
+  <g>
+    <rect x="10" y="10" width="400" height="400" rx="82" fill="url(#bgGrad2)"/>
+    <circle cx="185" cy="190" r="82" fill="url(#sunGrad2)"/>
+    <g stroke="#ffb347" stroke-width="12" stroke-linecap="round" opacity="0.95">
+      <line x1="185" y1="48" x2="185" y2="74"/>
+      <line x1="268" y1="70" x2="252" y2="92"/>
+      <line x1="310" y1="140" x2="286" y2="146"/>
+      <line x1="102" y1="70" x2="118" y2="92"/>
+      <line x1="60" y1="140" x2="84" y2="146"/>
+    </g>
+    <g transform="rotate(-8 210 260)">
+      <rect x="112" y="168" width="216" height="188" rx="12" fill="url(#paperGrad2)"/>
+      <rect x="130" y="190" width="96" height="22" rx="6" fill="#d13b2f"/>
+      <rect x="130" y="232" width="181" height="11" rx="5.5" fill="#9fb2c8"/>
+      <rect x="130" y="252" width="144" height="11" rx="5.5" fill="#b6c5d6"/>
+      <rect x="130" y="272" width="181" height="11" rx="5.5" fill="#c3d0df"/>
+      <rect x="130" y="292" width="80" height="48" rx="7" fill="#9fb2c8"/>
+      <path d="M328 356 L272 356 Q294 344 294 320 L328 320 Z" fill="#ffb347" opacity="0.9"/>
+    </g>
+    <circle cx="356" cy="96" r="13" fill="#ff5545" stroke="#10243f" stroke-width="6"/>
+  </g>
+
+  <!-- 字标 -->
+  <text x="470" y="252" font-family="'Helvetica Neue', Helvetica, Arial, 'PingFang SC', sans-serif"
+        font-size="150" font-weight="700" fill="#12293f" letter-spacing="-2">ReadDaily</text>
+  <text x="472" y="318" font-family="'PingFang SC', 'Microsoft YaHei', 'Helvetica Neue', sans-serif"
+        font-size="52" font-weight="600" fill="#5b7186" letter-spacing="6">读报 · 每日新闻引擎</text>
+  <rect x="474" y="342" width="180" height="8" rx="4" fill="#ff6b35"/>
+</svg>

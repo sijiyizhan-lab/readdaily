@@ -7,29 +7,42 @@ struct ReviewEditor: View {
     @ObservedObject var viewModel: ReadingDeskViewModel
 
     var body: some View {
-        if let issue = viewModel.issueDetail,
-           let edition = viewModel.selectedEdition,
-           let draft = viewModel.editorState?.draft {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 22) {
-                    reviewHeader(issue: issue, edition: edition, draft: draft)
-                    sourceAndOCR(edition: edition, draft: draft)
-                    summaryEditor(draft: draft)
-                    topicEditor(draft: draft)
-                    factEditor(draft: draft)
-                    importanceEditor(draft: draft)
-                    publishingBoundary
+        ZStack {
+            ReadingDeskBackground()
+            if let issue = viewModel.issueDetail,
+               let edition = viewModel.selectedEdition,
+               let draft = viewModel.editorState?.draft {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 20) {
+                        ReadingDeskWelcomeBanner(
+                            issue: issue,
+                            edition: edition,
+                            warningCount: viewModel.allWarnings.count
+                        )
+                        reviewHeader(issue: issue, edition: edition, draft: draft)
+                        sourceAndOCR(edition: edition, draft: draft)
+                        summaryEditor(draft: draft)
+                        topicEditor(draft: draft)
+                        factEditor(draft: draft)
+                        importanceEditor(draft: draft)
+                        publishingBoundary
+                    }
+                    .padding(24)
+                    .frame(maxWidth: 1120, alignment: .leading)
+                }
+                .groupBoxStyle(ReadingDeskGroupBoxStyle())
+            } else {
+                VStack(spacing: 18) {
+                    ReadingDeskWelcomeBanner(issue: nil, edition: nil, warningCount: 0)
+                    EmptyState(
+                        title: "选择一个版次开始复核",
+                        detail: "对照原版图检查 OCR，再完成摘要、主题、事实字段和重要性。",
+                        symbol: "doc.text.magnifyingglass"
+                    )
+                    .readingDeskCard(cool: true)
                 }
                 .padding(24)
-                .frame(maxWidth: 1120, alignment: .leading)
             }
-            .background(Color(nsColor: .textBackgroundColor).opacity(0.35))
-        } else {
-            EmptyState(
-                title: "选择一个版次开始复核",
-                detail: "对照原版图检查 OCR，再完成摘要、主题、事实字段和重要性。",
-                symbol: "doc.text.magnifyingglass"
-            )
         }
     }
 
@@ -47,34 +60,55 @@ struct ReviewEditor: View {
             if viewModel.dirtyUnitIDs.contains(edition.id) {
                 Label("尚未保存", systemImage: "circle.fill")
                     .font(.caption.weight(.medium))
-                    .foregroundStyle(.blue)
+                    .foregroundStyle(ReadingDeskTheme.accent)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
+                    .background(ReadingDeskTheme.accentSoft, in: Capsule())
             }
         }
+        .readingDeskCard(padding: 16, cool: true)
     }
 
     @ViewBuilder
     private func sourceAndOCR(edition: EditionRecord, draft: ArticleDraft) -> some View {
         HSplitView {
-            GroupBox("原版图") {
+            GroupBox {
                 PagePreview(
                     imagePath: edition.imagePath,
                     pdfPath: edition.pdfPath,
                     pageIndex: max((edition.pageNumber ?? 1) - 1, 0)
                 )
-                .frame(minWidth: 320, idealWidth: 480, maxWidth: .infinity, minHeight: 390)
+                .frame(minWidth: 280, idealWidth: 450, maxWidth: .infinity, minHeight: 370)
+            } label: {
+                Label("原版图", systemImage: "doc.richtext")
             }
             .accessibilityLabel("第\(edition.pageNumber ?? 0)版原版图")
 
-            GroupBox("OCR 原文（只读）") {
-                TextEditor(text: .constant(draft.ocrText.isEmpty ? "当前版次没有可用 OCR 原文。" : draft.ocrText))
-                    .font(.body)
-                    .lineSpacing(5)
-                    .disabled(true)
-                    .scrollContentBackground(.hidden)
-                    .padding(6)
-                    .accessibilityLabel("OCR 原文")
+            GroupBox {
+                ScrollView {
+                    Text(draft.ocrText.isEmpty ? "当前版次没有可用 OCR 原文。" : draft.ocrText)
+                        .font(.body)
+                        .lineSpacing(5)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .topLeading)
+                        .padding(10)
+                }
+                .background(ReadingDeskTheme.field, in: RoundedRectangle(cornerRadius: 8))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(ReadingDeskTheme.border)
+                }
+                .accessibilityLabel("OCR 原文，只读")
+            } label: {
+                HStack {
+                    Label("OCR 原文", systemImage: "text.viewfinder")
+                    Spacer()
+                    Text("\(draft.ocrText.count) 字")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
             }
-            .frame(minWidth: 320, idealWidth: 500, maxWidth: .infinity, minHeight: 390)
+            .frame(minWidth: 280, idealWidth: 480, maxWidth: .infinity, minHeight: 370)
         }
         .frame(minHeight: 420)
     }
@@ -99,10 +133,11 @@ struct ReviewEditor: View {
                 .lineSpacing(5)
                 .frame(minHeight: 132)
                 .padding(8)
-                .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+                .scrollContentBackground(.hidden)
+                .background(ReadingDeskTheme.field, in: RoundedRectangle(cornerRadius: 8))
                 .overlay {
                     RoundedRectangle(cornerRadius: 8)
-                        .stroke(Color(nsColor: .separatorColor))
+                        .stroke(ReadingDeskTheme.border)
                 }
                 .accessibilityLabel("中文摘要")
 
@@ -122,7 +157,7 @@ struct ReviewEditor: View {
     @ViewBuilder
     private func topicEditor(draft: ArticleDraft) -> some View {
         GroupBox {
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 220), spacing: 10)], alignment: .leading, spacing: 10) {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 190), spacing: 10)], alignment: .leading, spacing: 10) {
                 ForEach(ReadingTopic.allCases) { topic in
                     Button {
                         viewModel.toggleTopic(topic)
@@ -130,14 +165,25 @@ struct ReviewEditor: View {
                         HStack(spacing: 8) {
                             Image(systemName: draft.topics.contains(topic) ? "checkmark.circle.fill" : "circle")
                             Text(topic.rawValue)
-                                .lineLimit(2)
+                                .lineLimit(1)
                             Spacer(minLength: 0)
                         }
+                        .foregroundStyle(draft.topics.contains(topic) ? ReadingDeskTheme.accent : Color.primary)
                         .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
-                        .padding(.horizontal, 10)
+                        .padding(.horizontal, 12)
+                        .background(
+                            Capsule()
+                                .fill(draft.topics.contains(topic) ? ReadingDeskTheme.accentSoft : ReadingDeskTheme.field)
+                        )
+                        .overlay {
+                            Capsule()
+                                .stroke(
+                                    draft.topics.contains(topic) ? ReadingDeskTheme.accent : ReadingDeskTheme.border,
+                                    lineWidth: draft.topics.contains(topic) ? 1.5 : 1
+                                )
+                        }
                     }
-                    .buttonStyle(.bordered)
-                    .tint(draft.topics.contains(topic) ? .accentColor : .secondary)
+                    .buttonStyle(.plain)
                     .accessibilityLabel("主题：\(topic.rawValue)")
                     .accessibilityValue(draft.topics.contains(topic) ? "已选择" : "未选择")
                 }
@@ -175,7 +221,7 @@ struct ReviewEditor: View {
                             factRow("来源", index: index, keyPath: \FactFields.source, prompt: "例如：中国建设报第1版")
                         }
                     }
-                    if index != draft.facts.indices.last { Divider() }
+                    .readingDeskCard(padding: 12, cool: true)
                 }
                 if draft.facts.isEmpty {
                     Text("当前没有事实字段；发布前至少需要补充一条。")
@@ -186,6 +232,8 @@ struct ReviewEditor: View {
                     Label("添加事实", systemImage: "plus.circle")
                 }
                 .controlSize(.large)
+                .buttonStyle(.bordered)
+                .tint(ReadingDeskTheme.accent)
                 .accessibilityLabel("添加一条事实")
             }
             .padding(.vertical, 4)
@@ -250,7 +298,96 @@ struct ReviewEditor: View {
         .foregroundStyle(.secondary)
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+        .background(ReadingDeskTheme.cardCool, in: RoundedRectangle(cornerRadius: 12))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(ReadingDeskTheme.border)
+        }
+    }
+}
+
+private struct ReadingDeskWelcomeBanner: View {
+    let issue: IssueDetail?
+    let edition: EditionRecord?
+    let warningCount: Int
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorSchemeContrast) private var contrast
+
+    private static let dateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateFormat = "yyyy年M月d日"
+        return formatter
+    }()
+
+    var body: some View {
+        HStack(spacing: 16) {
+            ZStack {
+                Circle()
+                    .fill(ReadingDeskTheme.card.opacity(0.86))
+                Image(systemName: "building.2.crop.circle.fill")
+                    .font(.system(size: 28, weight: .semibold))
+                    .foregroundStyle(ReadingDeskTheme.accent)
+            }
+            .frame(width: 50, height: 50)
+            .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 5) {
+                Text("今日建设读报")
+                    .font(.title3.weight(.bold))
+                Text(summaryText)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+
+            Spacer(minLength: 12)
+
+            if let issue {
+                HStack(spacing: 8) {
+                    metric("\(issue.editions.count) 版", symbol: "rectangle.stack")
+                    if warningCount > 0 {
+                        metric("\(warningCount) 告警", symbol: "exclamationmark.triangle")
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 18)
+        .frame(maxWidth: .infinity, minHeight: 72, alignment: .leading)
+        .background(
+            LinearGradient(
+                colors: reduceTransparency
+                    ? [ReadingDeskTheme.card, ReadingDeskTheme.card]
+                    : [ReadingDeskTheme.bannerStart, ReadingDeskTheme.bannerEnd],
+                startPoint: .leading,
+                endPoint: .trailing
+            ),
+            in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(contrast == .increased ? ReadingDeskTheme.strongBorder : ReadingDeskTheme.border)
+        }
+        .shadow(color: reduceTransparency ? .clear : .black.opacity(0.055), radius: 7, y: 2)
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isHeader)
+    }
+
+    private var summaryText: String {
+        if let issue, let edition {
+            let number = issue.issueNumber.map { "第\($0)期 · " } ?? ""
+            return "\(issue.date) · \(number)正在复核第\(edition.pageNumber ?? 0)版"
+        }
+        return "\(Self.dateFormatter.string(from: Date())) · 准备一份中国建设报开始本地复核"
+    }
+
+    private func metric(_ text: String, symbol: String) -> some View {
+        Label(text, systemImage: symbol)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(ReadingDeskTheme.accent)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 6)
+            .background(ReadingDeskTheme.card.opacity(0.8), in: Capsule())
     }
 }
 
@@ -285,7 +422,11 @@ private struct PagePreview: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+        .background(ReadingDeskTheme.field, in: RoundedRectangle(cornerRadius: 8))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(ReadingDeskTheme.border)
+        }
     }
 }
 

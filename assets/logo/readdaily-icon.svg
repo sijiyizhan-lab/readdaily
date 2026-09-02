@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#10243f"/>
+      <stop offset="1" stop-color="#1d4a7a"/>
+    </linearGradient>
+    <linearGradient id="sunGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffc46b"/>
+      <stop offset="1" stop-color="#ff6b35"/>
+    </linearGradient>
+    <linearGradient id="paperGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#eef2f6"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 圆角底：深蓝晨曦 -->
+  <rect x="0" y="0" width="1024" height="1024" rx="200" fill="url(#bgGrad)"/>
+
+  <!-- 晨光：日出半圆 + 表盘式射线（每日） -->
+  <g>
+    <circle cx="430" cy="452" r="208" fill="url(#sunGrad)"/>
+    <g stroke="#ffb347" stroke-width="30" stroke-linecap="round" opacity="0.95">
+      <line x1="430" y1="96" x2="430" y2="168"/>
+      <line x1="640" y1="150" x2="594" y2="206"/>
+      <line x1="746" y1="336" x2="682" y2="352"/>
+      <line x1="222" y1="150" x2="266" y2="206"/>
+      <line x1="118" y1="336" x2="180" y2="352"/>
+    </g>
+  </g>
+
+  <!-- 报纸（微倾，折角翻开） -->
+  <g transform="rotate(-8 512 640)">
+    <rect x="242" y="430" width="540" height="470" rx="30" fill="url(#paperGrad)"/>
+    <!-- 报头红条 -->
+    <rect x="286" y="486" width="240" height="54" rx="14" fill="#d13b2f"/>
+    <rect x="308" y="506" width="96" height="14" rx="7" fill="#ffe9e6"/>
+    <rect x="308" y="528" width="62" height="10" rx="5" fill="#f3b8b1"/>
+    <!-- 版面线条（头条/双栏/图位） -->
+    <rect x="286" y="584" width="452" height="26" rx="13" fill="#9fb2c8"/>
+    <rect x="286" y="632" width="360" height="26" rx="13" fill="#b6c5d6"/>
+    <rect x="286" y="680" width="452" height="26" rx="13" fill="#c3d0df"/>
+    <rect x="286" y="728" width="200" height="120" rx="16" fill="#9fb2c8"/>
+    <rect x="512" y="728" width="226" height="22" rx="11" fill="#c3d0df"/>
+    <rect x="512" y="772" width="226" height="22" rx="11" fill="#cdd9e7"/>
+    <rect x="512" y="816" width="160" height="22" rx="11" fill="#d5dfeb"/>
+    <!-- 折角（翻开见光） -->
+    <path d="M782 900 L644 900 Q700 872 700 812 L782 812 Z" fill="#c9d6e4"/>
+    <path d="M782 900 L644 900 Q700 872 700 812 Z" fill="#ffb347" opacity="0.9"/>
+  </g>
+
+  <!-- 未读红点（每日新增） -->
+  <circle cx="818" cy="238" r="34" fill="#ff5545" stroke="#10243f" stroke-width="14"/>
+</svg>
