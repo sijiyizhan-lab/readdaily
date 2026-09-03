@@ -447,6 +447,233 @@ class AdapterDateValidationTests(unittest.TestCase):
         self.assertIn("连续", error)
         self.assertFalse((self.archive / "gmrb" / requested.isoformat()).exists())
 
+    def test_founder_static_index_preserves_unique_mixed_edition_codes(self):
+        requested = datetime.date(2026, 9, 3)
+        source = self.founder_source()
+        source["id"] = "nfrb"
+        source["name"] = "南方日报"
+        codes = ("A01", "A02", "CC01")
+        index = "<html><body>%s</body></html>" % "".join(
+            '<a href="../20260903/node_%s.html">第%s版 %s</a>'
+            % (code, code, "要闻" + code)
+            for code in codes
+        )
+        image = page_jpeg()
+
+        def fake_http_get(url, referer=None):
+            del referer
+            if url.endswith("index.html"):
+                return 200, url, index.encode()
+            if "/node_" in url:
+                code = url.rsplit("node_", 1)[1].split(".", 1)[0]
+                pic = "https://example.test/gmrb/html/20260903/pic_%s.jpg" % code
+                return 200, url, self.founder_layout_html(pic, "要闻" + code,
+                                                           "2026年09月03日").encode()
+            return 200, url, image
+
+        with mock.patch.object(founder.lib, "http_get", side_effect=fake_http_get):
+            issue, error = founder.fetch(source, requested, str(self.archive))
+
+        self.assertIsNone(error)
+        self.assertEqual([edition["no"] for edition in issue["editions"]], [1, 2, 3])
+        self.assertEqual(
+            [edition["edition_code"] for edition in issue["editions"]], list(codes)
+        )
+        self.assertEqual(
+            [unit["edition_code"] for unit in issue["units"]], list(codes)
+        )
+
+    def test_founder_static_index_rejects_duplicate_mixed_edition_code(self):
+        requested = datetime.date(2026, 9, 3)
+        source = self.founder_source()
+        source["id"] = "nfrb"
+        index = (
+            '<a href="../20260903/node_A01.html">第A01版 要闻</a>'
+            '<a href="../20260903/node_A01.html">第A01版 重复</a>'
+        )
+        with mock.patch.object(
+            founder.lib, "http_get", return_value=(200, source["index_url"], index.encode())
+        ):
+            issue, error = founder.fetch(source, requested, str(self.archive))
+
+        self.assertIsNone(issue)
+        self.assertIn("重复版号", error)
+
+    def test_founder_first_page_navigation_discovers_twenty_editions_once(self):
+        requested = datetime.date(2026, 9, 3)
+        source = {
+            "id": "rmrb",
+            "name": "人民日报",
+            "entry": "https://example.test/rmrb/",
+            "node_tpl": (
+                "https://example.test/rmrb/pc/layout/{y}{m}/{d}/"
+                "node_{page:02d}.html"
+            ),
+            "max_pages": 32,
+            "discover_from_first_nav": True,
+        }
+        base = "https://example.test/rmrb/pc/layout/202609/03/"
+        navigation = "".join(
+            '<a href="node_%02d.html">第%02d版</a>' % (number, number)
+            for number in range(1, 21)
+        )
+        navigation += (
+            '<a href="http://paper.people.com.cn/rmrb/pad/layout/'
+            '202609/03/node_01.html">移动版</a>'
+        )
+        image = page_jpeg()
+        requested_urls = []
+
+        def fake_http_get(url, referer=None):
+            del referer
+            requested_urls.append(url)
+            if "/node_" in url:
+                number = int(url.rsplit("node_", 1)[1].split(".", 1)[0])
+                if number == 21:
+                    return 404, url, b""
+                pic = "https://example.test/rmrb/pc/pic/202609/03/p%02d.jpg" % number
+                body = self.founder_layout_html(
+                    pic, "版面%02d" % number, "2026年09月03日"
+                )
+                if number == 1:
+                    body = body.replace("</body>", navigation + "</body>")
+                return 200, url, body.encode()
+            return 200, url, image
+
+        with mock.patch.object(founder.lib, "http_get", side_effect=fake_http_get):
+            issue, error = founder.fetch(source, requested, str(self.archive))
+
+        self.assertIsNone(error)
+        self.assertEqual(len(issue["editions"]), 20)
+        self.assertEqual(requested_urls.count(base + "node_01.html"), 1)
+        self.assertEqual(requested_urls.count(base + "node_21.html"), 1)
+
+    def test_founder_first_page_navigation_rejects_contiguous_partial_prefix(self):
+        requested = datetime.date(2026, 9, 3)
+        source = {
+            "id": "rmrb",
+            "name": "人民日报",
+            "entry": "https://example.test/rmrb/",
+            "node_tpl": (
+                "https://example.test/rmrb/pc/layout/{y}{m}/{d}/"
+                "node_{page:02d}.html"
+            ),
+            "max_pages": 32,
+            "discover_from_first_nav": True,
+        }
+        base = "https://example.test/rmrb/pc/layout/202609/03/"
+        navigation = (
+            '<a href="node_01.html">第01版</a>'
+            '<a href="node_02.html">第02版</a>'
+        )
+        image = page_jpeg()
+        requested_urls = []
+
+        def fake_http_get(url, referer=None):
+            del referer
+            requested_urls.append(url)
+            if "/node_" in url:
+                number = int(url.rsplit("node_", 1)[1].split(".", 1)[0])
+                pic = "https://example.test/rmrb/pc/pic/202609/03/p%02d.jpg" % number
+                body = self.founder_layout_html(
+                    pic, "版面%02d" % number, "2026年09月03日"
+                )
+                if number == 1:
+                    body = body.replace("</body>", navigation + "</body>")
+                return 200, url, body.encode()
+            return 200, url, image
+
+        with mock.patch.object(founder.lib, "http_get", side_effect=fake_http_get):
+            issue, error = founder.fetch(source, requested, str(self.archive))
+
+        self.assertIsNone(issue)
+        self.assertIn("导航不完整", error)
+        self.assertIn(base + "node_03.html", requested_urls)
+        self.assertFalse((self.archive / "rmrb" / requested.isoformat()).exists())
+
+    def test_founder_first_page_navigation_date_validates_existing_next_node(self):
+        requested = datetime.date(2026, 9, 3)
+        source = {
+            "id": "rmrb",
+            "name": "人民日报",
+            "entry": "https://example.test/rmrb/",
+            "node_tpl": (
+                "https://example.test/rmrb/pc/layout/{y}{m}/{d}/"
+                "node_{page:02d}.html"
+            ),
+            "max_pages": 32,
+            "discover_from_first_nav": True,
+        }
+        base = "https://example.test/rmrb/pc/layout/202609/03/"
+        navigation = '<a href="node_01.html">第01版</a>'
+        image = page_jpeg()
+
+        def fake_http_get(url, referer=None):
+            del referer
+            if url == base + "node_01.html":
+                body = self.founder_layout_html(
+                    "https://example.test/rmrb/pc/pic/202609/03/p01.jpg",
+                    "版面01",
+                    "2026年09月03日",
+                ).replace("</body>", navigation + "</body>")
+                return 200, url, body.encode()
+            if url == base + "node_02.html":
+                redirected = (
+                    "https://example.test/rmrb/pc/layout/202609/02/node_02.html"
+                )
+                body = self.founder_layout_html(
+                    "https://example.test/rmrb/pc/pic/202609/02/p02.jpg",
+                    "版面02",
+                    "2026年09月02日",
+                )
+                return 200, redirected, body.encode()
+            return 200, url, image
+
+        with mock.patch.object(founder.lib, "http_get", side_effect=fake_http_get):
+            issue, error = founder.fetch(source, requested, str(self.archive))
+
+        self.assertIsNone(issue)
+        self.assertIn("日期", error)
+        self.assertFalse((self.archive / "rmrb" / requested.isoformat()).exists())
+
+    def test_founder_first_page_navigation_rejects_next_node_above_cap(self):
+        requested = datetime.date(2026, 9, 3)
+        source = {
+            "id": "rmrb",
+            "name": "人民日报",
+            "entry": "https://example.test/rmrb/",
+            "node_tpl": (
+                "https://example.test/rmrb/pc/layout/{y}{m}/{d}/"
+                "node_{page:02d}.html"
+            ),
+            "max_pages": 2,
+            "discover_from_first_nav": True,
+        }
+        base = "https://example.test/rmrb/pc/layout/202609/03/"
+        navigation = (
+            '<a href="node_01.html">第01版</a>'
+            '<a href="node_02.html">第02版</a>'
+        )
+
+        def fake_http_get(url, referer=None):
+            del referer
+            number = int(url.rsplit("node_", 1)[1].split(".", 1)[0])
+            body = self.founder_layout_html(
+                "https://example.test/rmrb/pc/pic/202609/03/p%02d.jpg" % number,
+                "版面%02d" % number,
+                "2026年09月03日",
+            )
+            if number == 1:
+                body = body.replace("</body>", navigation + "</body>")
+            return 200, url, body.encode()
+
+        with mock.patch.object(founder.lib, "http_get", side_effect=fake_http_get):
+            issue, error = founder.fetch(source, requested, str(self.archive))
+
+        self.assertIsNone(issue)
+        self.assertIn("上限", error)
+        self.assertFalse((self.archive / "rmrb" / requested.isoformat()).exists())
+
     def test_founder_static_index_rejects_mixed_date_edition_links(self):
         requested = datetime.date(2026, 9, 2)
         index = (
@@ -535,6 +762,28 @@ class AdapterDateValidationTests(unittest.TestCase):
         self.assertIsNone(issue)
         self.assertIn("日期", error)
         self.assertFalse((self.archive / "gmrb" / requested.isoformat()).exists())
+
+    def test_founder_dated_url_overrides_stale_publishdate_metadata(self):
+        requested = datetime.date(2026, 9, 3)
+        url = "https://example.test/rmrb/pc/content/202609/03/content_1.html"
+        html = (
+            "<html><head><title>当日要闻</title>"
+            "<meta name='publishdate' content='2013-07-17'></head></html>"
+        )
+
+        self.assertIsNone(
+            founder._response_date_error(requested, url, url, html)
+        )
+
+    def test_founder_dated_url_still_rejects_conflicting_title_date(self):
+        requested = datetime.date(2026, 9, 3)
+        url = "https://example.test/rmrb/pc/layout/202609/03/node_01.html"
+        html = "<html><head><title>人民日报 2026年09月02日</title></head></html>"
+
+        self.assertIn(
+            "页面内容日期",
+            founder._response_date_error(requested, url, url, html),
+        )
 
     def test_founder_dynamic_probe_treats_server_error_as_failure_not_end_of_issue(self):
         requested = datetime.date(2026, 9, 2)

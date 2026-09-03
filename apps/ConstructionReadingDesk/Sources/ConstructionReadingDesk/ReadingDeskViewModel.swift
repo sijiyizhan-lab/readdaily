@@ -9,6 +9,12 @@ struct PresentedError: Identifiable {
     let recovery: String
 }
 
+enum NoticeSeverity: Equatable {
+    case success
+    case warning
+    case information
+}
+
 struct IssuePayloadMappingExecutor: Sendable {
     typealias Transform = @Sendable (JSONValue?) throws -> IssueDetail
 
@@ -63,6 +69,9 @@ final class ReadingDeskViewModel: ObservableObject {
     }
     @Published private(set) var history: [HistoryTransaction] = []
     @Published var notice: String?
+    @Published private(set) var noticeSeverity: NoticeSeverity = .information
+    @Published private(set) var fetchRunSummary: FetchRunSummary?
+    @Published private(set) var fetchingSourceIDs: Set<String> = []
     @Published private(set) var lastLog = ""
     @Published var showingDiscardChangesConfirmation = false
 
@@ -95,6 +104,7 @@ final class ReadingDeskViewModel: ObservableObject {
     private enum NavigationAction: Equatable, Sendable {
         case refresh
         case fetchDaily(String)
+        case fetchSources(String, [String])
         case selectDate(String)
         case selectIssue(String?)
         case importPDF(URL, Bool)
@@ -105,6 +115,7 @@ final class ReadingDeskViewModel: ObservableObject {
         case refresh
         case loadIssue(String, String)
         case fetchDaily(String)
+        case fetchSources(String, [String])
         case importPDF(URL, Bool)
         case save
         case preview
@@ -190,7 +201,7 @@ final class ReadingDeskViewModel: ObservableObject {
         }
         guard values.changesDataContext(comparedTo: current) else {
             settings.apply(values)
-            notice = "今日信息设置已应用。"
+            setNotice("今日信息设置已应用。", severity: .success)
             return true
         }
         guard navigationGate.request(.applySettings(values), hasUnsavedChanges: hasUnsavedChanges) else {
@@ -206,13 +217,15 @@ final class ReadingDeskViewModel: ObservableObject {
         settings.apply(values)
         issues = []
         dashboardDay = nil
+        fetchRunSummary = nil
+        fetchingSourceIDs = []
         availableDates = []
         selectedDate = nil
         history = []
         publishPlan = nil
         clearIssueSelection()
         editRevision = 0
-        notice = "路径设置已应用，正在从新目录重新载入。"
+        setNotice("路径设置已应用，正在从新目录重新载入。", severity: .information)
         refreshNow()
     }
 
@@ -393,27 +406,50 @@ final class ReadingDeskViewModel: ObservableObject {
             showingDiscardChangesConfirmation = true
             return
         }
-        fetchDailyPapersNow(date: date)
+        fetchDailyPapersNow(date: date, sourceIDs: nil)
     }
 
-    private func fetchDailyPapersNow(date: String) {
+    func retryFailedDailyPapers() {
+        guard !isEditorialBusy,
+              let summary = fetchRunSummary,
+              !summary.retryableSourceIDs.isEmpty else { return }
+        let sourceIDs = summary.retryableSourceIDs
+        let action = NavigationAction.fetchSources(summary.date, sourceIDs)
+        guard navigationGate.request(action, hasUnsavedChanges: hasUnsavedChanges) else {
+            showingDiscardChangesConfirmation = true
+            return
+        }
+        fetchDailyPapersNow(date: summary.date, sourceIDs: sourceIDs)
+    }
+
+    private func fetchDailyPapersNow(date: String, sourceIDs: [String]?) {
         guard !isEditorialBusy else { return }
         selectedDate = date
+        let requestedSourceIDs = sourceIDs ?? NewspaperRegistry.dailySources.map(\.id)
+        guard !requestedSourceIDs.isEmpty else { return }
         let revisionAtStart = editRevision
         isFetchingDaily = true
-        fetchOperationTitle = "正在抓取 \(date) 当日8报"
+        fetchingSourceIDs = Set(requestedSourceIDs)
+        fetchOperationTitle = sourceIDs == nil
+            ? "正在抓取 \(date) 当日8报"
+            : "正在补抓 \(requestedSourceIDs.count) 份失败或缺失报纸"
         presentedError = nil
         retryAction = nil
         fetchTask = Task { [weak self] in
             guard let self else { return }
             defer {
                 self.isFetchingDaily = false
+                self.fetchingSourceIDs = []
                 self.fetchOperationTitle = ""
                 self.fetchTask = nil
             }
             do {
                 let client = self.makeClient()
-                self.lastLog = try await client.fetchDaily(date: date)
+                self.lastLog = if let sourceIDs {
+                    try await client.fetchSources(date: date, sourceIDs: sourceIDs)
+                } else {
+                    try await client.fetchDaily(date: date)
+                }
                 self.invalidateIssueCache()
                 try await self.refreshInboxNow(client: client, loadSelection: false)
 
@@ -434,20 +470,35 @@ final class ReadingDeskViewModel: ObservableObject {
                     )
                 }
 
-                let entries = self.dashboardDay?.entries ?? []
-                let available = entries.filter { $0.issue != nil }.count
-                let failed = entries.filter { $0.status == .failed }.count
-                if keptLateEdits {
-                    self.notice = "抓取完成；当前未保存编辑已保留，请保存后再刷新本报。"
-                } else if available == NewspaperRegistry.dailySources.count, failed == 0 {
-                    self.notice = "当日8报均已获取，读报台已刷新。"
+                let summary: FetchRunSummary
+                if let day = self.dashboardDay, day.date == date {
+                    summary = FetchRunSummary(day: day)
                 } else {
-                    self.notice = "抓取结束：已获取 \(available)/8 份"
-                        + (failed > 0 ? "，\(failed) 份失败" : "")
-                        + "；缺报可稍后重试。"
+                    summary = FetchRunSummary(
+                        day: DailyReadingDashboard(issues: self.issues).day(for: date)
+                    )
+                }
+                self.fetchRunSummary = summary
+                let failedNames = summary.failedSourceNames.joined(separator: "、")
+                if keptLateEdits {
+                    self.setNotice(
+                        "抓取完成：已获取 \(summary.successfulCount)/8；当前未保存编辑已保留。"
+                            + (failedNames.isEmpty ? "" : " 未获取：\(failedNames)。"),
+                        severity: summary.isComplete ? .information : .warning
+                    )
+                } else if summary.isComplete {
+                    self.setNotice("当日8报均已获取，读报台已刷新。", severity: .success)
+                } else {
+                    self.setNotice(
+                        "抓取结束：已获取 \(summary.successfulCount)/8 份；未获取：\(failedNames)。",
+                        severity: .warning
+                    )
                 }
             } catch {
-                self.show(error, retry: .fetchDaily(date))
+                self.show(
+                    error,
+                    retry: sourceIDs.map { .fetchSources(date, $0) } ?? .fetchDaily(date)
+                )
             }
         }
     }
@@ -502,7 +553,7 @@ final class ReadingDeskViewModel: ObservableObject {
                 await self.loadDashboardNow(date: date, client: client)
                 self.startIssueLoad(source: source, date: date, client: client, recordOpened: true)
             }
-            self.notice = "PDF 已导入归档目录，等待人工复核。"
+            self.setNotice("PDF 已导入归档目录，等待人工复核。", severity: .success)
         }
     }
 
@@ -521,9 +572,12 @@ final class ReadingDeskViewModel: ObservableObject {
                     self.editorState = editor
                 }
             }
-            self.notice = self.editRevision == revision
-                ? "草稿已保存到本地归档，尚未写入 Obsidian。"
-                : "保存完成；保存期间又有新编辑，请再次保存。"
+            self.setNotice(
+                self.editRevision == revision
+                    ? "草稿已保存到本地归档，尚未写入 Obsidian。"
+                    : "保存完成；保存期间又有新编辑，请再次保存。",
+                severity: self.editRevision == revision ? .success : .warning
+            )
         }
     }
 
@@ -543,7 +597,7 @@ final class ReadingDeskViewModel: ObservableObject {
             let client = self.makeClient()
             _ = try await client.saveDraft(request)
             guard self.editRevision == revision else {
-                self.notice = "生成预览期间内容已变化；当前修改仍未保存，请重新保存并预览。"
+                self.setNotice("生成预览期间内容已变化；当前修改仍未保存，请重新保存并预览。", severity: .warning)
                 return
             }
             self.dirtyUnitIDs.removeAll()
@@ -557,7 +611,7 @@ final class ReadingDeskViewModel: ObservableObject {
                 currentRevision: self.editRevision,
                 hasUnsavedChanges: self.hasUnsavedChanges
             ) else {
-                self.notice = "生成预览期间内容已变化；旧预览已作废，请重新预览。"
+                self.setNotice("生成预览期间内容已变化；旧预览已作废，请重新预览。", severity: .warning)
                 return
             }
             let plan = try WorkbenchPayloadMapper()
@@ -587,7 +641,10 @@ final class ReadingDeskViewModel: ObservableObject {
             let result = try await self.makeClient().perform(.publishApply(planID: planID))
             let transactionID = result.data?.objectValue?["transaction_id"]?.stringValue
             self.publishPlan = nil
-            self.notice = transactionID == nil ? "发布完成。" : "发布完成，已创建可回滚事务。"
+            self.setNotice(
+                transactionID == nil ? "发布完成。" : "发布完成，已创建可回滚事务。",
+                severity: .success
+            )
             try await self.loadHistoryNow(client: self.makeClient())
             try await self.refreshInboxNow(client: self.makeClient(), loadSelection: false)
         }
@@ -607,7 +664,7 @@ final class ReadingDeskViewModel: ObservableObject {
             _ = try await client.perform(.rollback(transactionID: transactionID))
             try await self.loadHistoryNow(client: client)
             try await self.refreshInboxNow(client: client, loadSelection: false)
-            self.notice = "发布已回滚；若知识库文件在发布后被手工修改，后端会拒绝覆盖。"
+            self.setNotice("发布已回滚；若知识库文件在发布后被手工修改，后端会拒绝覆盖。", severity: .information)
         }
     }
 
@@ -633,9 +690,12 @@ final class ReadingDeskViewModel: ObservableObject {
                     backendRevision: backendRevision
                 )
                 await self.loadDashboardNow(date: issue.date, client: client)
-                self.notice = status == .completed
-                    ? "已记录今日读完 \(issue.sourceName ?? issue.sourceID)。"
-                    : "已撤销今日完成标记。"
+                self.setNotice(
+                    status == .completed
+                        ? "已记录今日读完 \(issue.sourceName ?? issue.sourceID)。"
+                        : "已撤销今日完成标记。",
+                    severity: .success
+                )
             } catch {
                 // The cancelled automatic ``opened`` process may already have
                 // committed.  Re-read the authoritative dashboard instead of
@@ -663,6 +723,8 @@ final class ReadingDeskViewModel: ObservableObject {
         case .fetchDaily(let date):
             selectedDate = date
             fetchDailyPapers()
+        case .fetchSources(let date, let sourceIDs):
+            fetchDailyPapersNow(date: date, sourceIDs: sourceIDs)
         case .importPDF(let url, let remove): importPDF(url, removeAfterImport: remove)
         case .save: saveDraft()
         case .preview: previewPublish()
@@ -678,7 +740,9 @@ final class ReadingDeskViewModel: ObservableObject {
         guard let action = navigationGate.confirmDiscard() else { return }
         switch action {
         case .refresh: refreshNow()
-        case .fetchDaily(let date): fetchDailyPapersNow(date: date)
+        case .fetchDaily(let date): fetchDailyPapersNow(date: date, sourceIDs: nil)
+        case .fetchSources(let date, let sourceIDs):
+            fetchDailyPapersNow(date: date, sourceIDs: sourceIDs)
         case .selectDate(let date): selectDateNow(date)
         case .selectIssue(let id): selectIssueNow(id)
         case .importPDF(let url, let removeAfterImport):
@@ -805,6 +869,7 @@ final class ReadingDeskViewModel: ObservableObject {
             return true
         } catch {
             dashboardDay = DailyReadingDashboard(issues: issues).day(for: date)
+            if let dashboardDay { fetchRunSummary = FetchRunSummary(day: dashboardDay) }
             availableDates = ReadingDatePolicy.menuDates(
                 availableDates: legacyDates,
                 selectedDate: selectedDate,
@@ -839,6 +904,7 @@ final class ReadingDeskViewModel: ObservableObject {
             return responseIsStale(for: $0.key)
         }
         dashboardDay = day
+        fetchRunSummary = FetchRunSummary(day: day)
         availableDates = ReadingDatePolicy.menuDates(
             availableDates: day.availableDates + legacyDates + [day.date],
             selectedDate: selectedDate,
@@ -1365,5 +1431,10 @@ final class ReadingDeskViewModel: ObservableObject {
             detail: localized?.failureReason ?? error.localizedDescription,
             recovery: localized?.recoverySuggestion ?? "请修正后重试。"
         )
+    }
+
+    private func setNotice(_ text: String, severity: NoticeSeverity) {
+        noticeSeverity = severity
+        notice = text
     }
 }

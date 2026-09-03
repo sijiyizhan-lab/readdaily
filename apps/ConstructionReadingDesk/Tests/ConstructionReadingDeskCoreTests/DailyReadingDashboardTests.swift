@@ -44,6 +44,33 @@ struct DailyReadingDashboardTests {
         #expect(entries.first(where: { $0.source.id == "gmrb" })?.readingStatus.accessibleLabel == "今日未读")
     }
 
+    @Test("部分成功摘要列出失败和缺失来源供定向补抓")
+    func fetchSummaryIdentifiesOnlyUnavailableSources() {
+        let day = DailyReadingDashboard.day(date: "2026-09-03", issues: [
+            IssueSummary(
+                sourceID: "zgjsb",
+                sourceName: "中国建设报",
+                date: "2026-09-03",
+                stage: "needs_review",
+                pageCount: 8
+            ),
+            IssueSummary(
+                sourceID: "rmrb",
+                sourceName: "人民日报",
+                date: "2026-09-03",
+                stage: "failed",
+                warnings: ["版次超限"]
+            ),
+        ])
+
+        let summary = FetchRunSummary(day: day)
+
+        #expect(summary.successfulCount == 1)
+        #expect(!summary.isComplete)
+        #expect(summary.retryableSourceIDs == ["rmrb", "gmrb", "jjrb", "kjrb", "nmrb", "nfrb", "bjrb"])
+        #expect(summary.retryableEntries.first { $0.source.id == "rmrb" }?.statusDetail == "版次超限")
+    }
+
     @Test("仪表盘日期倒序且旧 inbox 结构仍可生成八报日视图")
     func dashboardGroupsLegacyInboxByDateDescending() {
         let issues = [

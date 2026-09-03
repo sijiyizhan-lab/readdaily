@@ -540,6 +540,57 @@ class AdapterParseIntegrityTests(unittest.TestCase):
         self.assertIn("正文为空或过短", error)
         self.assertEqual(issue_path.read_bytes(), original)
 
+    def test_mobile_accepts_short_image_news_caption_with_self_closing_image(self):
+        issue = self.mobile_issue()
+        article = issue["units"][0]["articles"][0]
+        article["title"] = "图片新闻"
+        issue["units"][0]["articles"] = [article]
+        self.write_issue("bjrb", issue)
+        caption = "城市更新重点工程近日竣工，图为市民在新建公共空间休闲。"
+        raw = (
+            '<html><body><div id="content"><img src="photo.jpg" />'
+            '<p>%s</p></div><footer>页脚不应入库</footer></body></html>' % caption
+        ).encode()
+
+        with mock.patch.object(
+            mobile_epaper.lib,
+            "http_get",
+            return_value=(200, article["url"], raw),
+        ):
+            parsed, error = mobile_epaper.parse(
+                self.mobile_source(), self.day, str(self.archive)
+            )
+
+        self.assertIsNone(error)
+        parsed_article = parsed["units"][0]["articles"][0]
+        self.assertEqual(parsed_article["text"], caption)
+        self.assertEqual(parsed_article["content_kind"], "image_caption")
+        self.assertNotIn("页脚", parsed_article["text"])
+
+    def test_mobile_does_not_accept_self_closing_image_outside_content(self):
+        issue = self.mobile_issue()
+        article = issue["units"][0]["articles"][0]
+        article["title"] = "图片新闻"
+        issue["units"][0]["articles"] = [article]
+        issue_path, original = self.write_issue("bjrb", issue)
+        caption = "城市更新重点工程近日竣工，图为市民在新建公共空间休闲。"
+        raw = (
+            '<html><body><img src="shell.jpg" />'
+            '<div id="content"><p>%s</p></div></body></html>' % caption
+        ).encode()
+
+        with mock.patch.object(
+            mobile_epaper.lib,
+            "http_get",
+            return_value=(200, article["url"], raw),
+        ):
+            _parsed, error = mobile_epaper.parse(
+                self.mobile_source(), self.day, str(self.archive)
+            )
+
+        self.assertIn("正文为空或过短", error)
+        self.assertEqual(issue_path.read_bytes(), original)
+
     def test_mobile_preserves_article_text_beyond_legacy_limits(self):
         issue = self.mobile_issue()
         issue["units"][0]["articles"] = issue["units"][0]["articles"][:1]
@@ -888,6 +939,53 @@ class AdapterParseIntegrityTests(unittest.TestCase):
                 "建设投资、城市更新与产业创新共同形成完整的长段落。",
             ],
         )
+
+    def test_founder_accepts_gmrb_main_class_without_outer_duplicate(self):
+        issue = self.founder_issue()
+        article = issue["units"][0]["articles"][0]
+        issue["units"][0]["articles"] = [article]
+        self.write_issue("gmrb", issue)
+        raw = (
+            '<html><body><h1>光明日报测试稿</h1>'
+            '<div class="m-article-text"><p>外层重复图文不应入库。</p>'
+            '<div class="layout m-article-main"><p>光明日报正文。</p></div></div>'
+            '<footer>相关推荐不应入库</footer></body></html>'
+        ).encode()
+
+        with mock.patch.object(
+            founder.lib, "http_get", return_value=(200, article["url"], raw)
+        ):
+            parsed, error = founder.parse(
+                self.founder_source(), self.day, str(self.archive)
+            )
+
+        self.assertIsNone(error)
+        self.assertEqual(parsed["units"][0]["articles"][0]["text"], "光明日报正文。")
+
+    def test_founder_accepts_jjrb_title_id_and_detail_art_body(self):
+        issue = self.founder_issue()
+        issue["source"] = "jjrb"
+        issue["source_name"] = "经济日报"
+        article = issue["units"][0]["articles"][0]
+        issue["units"][0]["articles"] = [article]
+        self.write_issue("jjrb", issue)
+        source = dict(self.founder_source(), id="jjrb", name="经济日报")
+        raw = (
+            '<html><body><div id=Title><span>经济日报现场标题</span></div>'
+            '<section class="detail-art article"><p>外层装饰不应入库。</p>'
+            '<div id=ozoom class=content><p>经济日报正文。</p></div></section>'
+            '<aside>侧栏不应入库</aside></body></html>'
+        ).encode()
+
+        with mock.patch.object(
+            founder.lib, "http_get", return_value=(200, article["url"], raw)
+        ):
+            parsed, error = founder.parse(source, self.day, str(self.archive))
+
+        self.assertIsNone(error)
+        parsed_article = parsed["units"][0]["articles"][0]
+        self.assertEqual(parsed_article["title"], "经济日报现场标题")
+        self.assertEqual(parsed_article["text"], "经济日报正文。")
 
     def test_founder_long_embedded_lead_still_fetches_authoritative_detail(self):
         issue = self.founder_issue()

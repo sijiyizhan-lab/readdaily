@@ -46,7 +46,8 @@
    "pic_tpls": [
     "https://paper.people.com.cn/rmrb/pc/pic/{y}{m}/{d}/{name}.jpg"
    ],
-   "max_pages": 14
+   "max_pages": 32,
+   "discover_from_first_nav": true
   },
   {
    "id": "gmrb",

@@ -138,6 +138,7 @@ class _ContentParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.found = False
         self.closed = False
+        self.has_image = False
         self.parts = []
         self._stack = []
 
@@ -150,6 +151,8 @@ class _ContentParser(HTMLParser):
             return
         if not self._stack:
             return
+        if tag == "img":
+            self.has_image = True
         if tag in _BLOCK_TAGS:
             self.parts.append("\n")
         if tag not in _VOID_TAGS:
@@ -157,7 +160,11 @@ class _ContentParser(HTMLParser):
 
     def handle_startendtag(self, tag, attrs):
         del attrs
-        if self._stack and tag in _BLOCK_TAGS:
+        if not self._stack:
+            return
+        if tag == "img":
+            self.has_image = True
+        if tag in _BLOCK_TAGS:
             self.parts.append("\n")
 
     def handle_data(self, data):
@@ -185,10 +192,20 @@ def _parse_index(html):
 
 
 def _extract_content(html):
+    found, closed, text, _has_image = _extract_content_details(html)
+    return found, closed, text
+
+
+def _extract_content_details(html):
     parser = _ContentParser()
     parser.feed(html)
     parser.close()
-    return parser.found, parser.closed, _normalized_text(parser.parts)
+    return (
+        parser.found,
+        parser.closed,
+        _normalized_text(parser.parts),
+        parser.has_image,
+    )
 
 
 def _fmt(tpl, d):
@@ -470,7 +487,7 @@ def parse(src, d, archive_root, max_per_edition=20):
             if final_dates != {d}:
                 return issue, "文章最终 URL 日期与请求日期不一致"
             h = lib.html_text(raw)
-            content_found, content_closed, t = _extract_content(h)
+            content_found, content_closed, t, has_image = _extract_content_details(h)
             if not content_found:
                 return issue, "第%s版第%s篇文章缺少明确 id=content 正文容器" % (
                     unit_index, article_index
@@ -483,9 +500,12 @@ def parse(src, d, archive_root, max_per_edition=20):
             parsed_article["url"] = final_url
             parsed_article["text"] = t
             if len(t) < 40:
-                return issue, "第%s版第%s篇文章正文为空或过短" % (
-                    unit_index, article_index
-                )
+                if t and has_image and "图片新闻" in str(a.get("title") or ""):
+                    parsed_article["content_kind"] = "image_caption"
+                else:
+                    return issue, "第%s版第%s篇文章正文为空或过短" % (
+                        unit_index, article_index
+                    )
             parsed_articles.append(parsed_article)
             txts.append(f"{a.get('title','')}\n{t}")
         u["articles"] = parsed_articles

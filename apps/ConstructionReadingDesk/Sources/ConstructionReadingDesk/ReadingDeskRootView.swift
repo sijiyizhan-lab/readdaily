@@ -42,7 +42,9 @@ struct ReadingDeskRootView: View {
             }
             .overlay(alignment: .bottom) {
                 if let notice = viewModel.notice {
-                    NoticeBanner(text: notice) { viewModel.notice = nil }
+                    NoticeBanner(text: notice, severity: viewModel.noticeSeverity) {
+                        viewModel.notice = nil
+                    }
                         .padding(18)
                 }
             }
@@ -226,6 +228,7 @@ private struct DailyInboxSidebar: View {
                                             isSelected: entry.issue?.stableID == viewModel.selectedIssueID,
                                             isLoading: viewModel.isIssueLoading
                                                 && entry.issue?.stableID == viewModel.selectedIssueID,
+                                            isFetching: viewModel.fetchingSourceIDs.contains(entry.source.id),
                                             readingStatus: viewModel.displayedReadingStatus(for: entry)
                                         ) {
                                             if let issue = entry.issue { viewModel.selectIssue(issue.stableID) }
@@ -240,6 +243,15 @@ private struct DailyInboxSidebar: View {
                         }
                     }
                     .padding(.bottom, 8)
+                }
+
+                if let summary = viewModel.fetchRunSummary,
+                   summary.date == viewModel.selectedDate {
+                    FetchRunSummaryCard(
+                        summary: summary,
+                        isFetching: viewModel.isFetchingDaily,
+                        onRetry: viewModel.retryFailedDailyPapers
+                    )
                 }
 
                 if viewModel.isEditorialBusy || viewModel.isIssueLoading {
@@ -290,13 +302,14 @@ private struct DailyPaperRow: View {
     let entry: DailyNewspaperEntry
     let isSelected: Bool
     let isLoading: Bool
+    let isFetching: Bool
     let readingStatus: ReadingCompletionStatus
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
             HStack(spacing: 9) {
-                Image(systemName: entry.status.symbolName).foregroundStyle(statusColor).frame(width: 18)
+                Image(systemName: displayedStatus.symbolName).foregroundStyle(statusColor).frame(width: 18)
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
                         Text(entry.source.name).font(.body.weight(.semibold))
@@ -307,7 +320,10 @@ private struct DailyPaperRow: View {
                             Image(systemName: readingStatus.symbolName).foregroundStyle(readingColor)
                         }
                     }
-                    Text(entry.status.accessibleLabel).font(.caption).foregroundStyle(.secondary)
+                    Text(isFetching ? "正在抓取" : entry.statusDetail)
+                        .font(.caption)
+                        .foregroundStyle(displayedStatus == .failed ? ReadingDeskTheme.statusFailure : .secondary)
+                        .lineLimit(2)
                     Label {
                         Text(readingStatus.accessibleLabel)
                             .foregroundStyle(.primary)
@@ -327,18 +343,22 @@ private struct DailyPaperRow: View {
         .buttonStyle(.plain)
         .disabled(entry.issue == nil)
         .opacity(entry.issue == nil ? 0.72 : 1)
-        .accessibilityLabel("\(entry.source.name)，\(entry.status.accessibleLabel)，\(readingStatus.accessibleLabel)")
+        .accessibilityLabel("\(entry.source.name)，\(isFetching ? "正在抓取" : entry.statusDetail)，\(readingStatus.accessibleLabel)")
         .accessibilityValue(isSelected ? "已选择" : "未选择")
     }
 
     private var statusColor: Color {
-        switch entry.status {
+        switch displayedStatus {
         case .published, .reviewComplete, .readyToPublish: return ReadingDeskTheme.statusPositive
         case .readyForReview: return ReadingDeskTheme.statusAttention
         case .running: return .blue
         case .failed: return ReadingDeskTheme.statusFailure
         case .notStarted: return .secondary
         }
+    }
+
+    private var displayedStatus: DailyRunStatus {
+        isFetching ? .running : entry.status
     }
 
     private var readingColor: Color {
@@ -490,13 +510,57 @@ private struct EmptyRow: View {
     }
 }
 
+private struct FetchRunSummaryCard: View {
+    let summary: FetchRunSummary
+    let isFetching: Bool
+    let onRetry: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label(
+                    "抓取结果 \(summary.successfulCount)/\(NewspaperRegistry.dailySources.count)",
+                    systemImage: summary.isComplete ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+                )
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(summary.isComplete ? ReadingDeskTheme.statusPositive : ReadingDeskTheme.statusAttention)
+                Spacer()
+                if isFetching { ProgressView().controlSize(.small) }
+            }
+
+            ForEach(summary.retryableEntries) { entry in
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(entry.source.name).font(.caption.weight(.semibold))
+                    Text(entry.statusDetail)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+            }
+
+            if !summary.retryableSourceIDs.isEmpty {
+                Button(action: onRetry) {
+                    Label("仅补抓失败/缺失报纸", systemImage: "arrow.clockwise")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .disabled(isFetching)
+                .help("只重新抓取 \(summary.failedSourceNames.joined(separator: "、"))")
+            }
+        }
+        .readingDeskCard(padding: 10, cool: true)
+        .accessibilityElement(children: .contain)
+    }
+}
+
 private struct NoticeBanner: View {
     let text: String
+    let severity: NoticeSeverity
     let dismiss: () -> Void
 
     var body: some View {
         HStack(spacing: 10) {
-            Image(systemName: "checkmark.circle.fill").foregroundStyle(ReadingDeskTheme.statusPositive)
+            Image(systemName: symbolName).foregroundStyle(iconColor)
             Text(text)
             Button(action: dismiss) { Image(systemName: "xmark") }
                 .buttonStyle(.plain).accessibilityLabel("关闭提示")
@@ -508,6 +572,22 @@ private struct NoticeBanner: View {
         .accessibilityElement(children: .contain)
         .onAppear { announce(text) }
         .onChange(of: text) { announce($0) }
+    }
+
+    private var symbolName: String {
+        switch severity {
+        case .success: return "checkmark.circle.fill"
+        case .warning: return "exclamationmark.triangle.fill"
+        case .information: return "info.circle.fill"
+        }
+    }
+
+    private var iconColor: Color {
+        switch severity {
+        case .success: return ReadingDeskTheme.statusPositive
+        case .warning: return ReadingDeskTheme.statusAttention
+        case .information: return ReadingDeskTheme.accent
+        }
     }
 
     private func announce(_ message: String) {

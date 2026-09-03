@@ -288,11 +288,11 @@ def verify_artifacts(out_dir, d):
     base = os.path.join(out_dir, ACCOUNT, f"{d.isoformat()}_读报")
     cands = glob.glob(base + "*.pdf")
     pdf = sorted(cands)[-1] if cands else None
-    if not pdf or not os.path.getsize(pdf) > 100 * 1024:
-        raise RuntimeError("PDF 缺失或过小")
-    with open(pdf, "rb") as f:
-        if f.read(5) != b"%PDF-":
-            raise RuntimeError("PDF 头无效")
+    if not pdf:
+        raise RuntimeError("PDF 缺失")
+    pdf_error = validate_pdf_artifact(pdf)
+    if pdf_error:
+        raise RuntimeError(pdf_error)
     md = pdf[:-4] + ".md"
     js = pdf[:-4] + ".json"
     html_f = pdf[:-4] + "_原文.html"
@@ -423,14 +423,85 @@ def ocr_issue_number(img_path):
 
 
 def pdf_page_count(path):
-    """尽力获取 PDF 页数（macOS mdls）；失败返回 None。"""
+    """获取 PDF 页数；Spotlight 未就绪时回退到 PDF 页面对象计数。"""
     try:
         p = subprocess.run(["mdls", "-name", "kMDItemNumberOfPages", path],
                            capture_output=True, text=True, timeout=20)
         m = re.search(r"= (\d+)", p.stdout)
-        return int(m.group(1)) if m else None
+        if m:
+            return int(m.group(1))
     except Exception:  # noqa: BLE001
+        pass
+    try:
+        with open(path, "rb") as stream:
+            raw = stream.read()
+        # Chrome 输出的每一页都有独立的 /Type /Page 对象。词边界排除
+        # /Type /Pages；这个回退无需等待 Spotlight 建立索引。
+        count = len(re.findall(rb"/Type\s*/Page\b", raw))
+        return count or None
+    except (OSError, MemoryError):
         return None
+
+
+def validate_pdf_artifact(path, expected_pages=None):
+    """Return a concrete validation error, or ``None`` for a complete PDF.
+
+    File size is deliberately not a quality signal: a valid text-heavy issue can
+    be smaller than 100 KiB.  Completion instead requires a PDF header, a final
+    EOF marker and, when known, the exact expected page count.
+    """
+    try:
+        size = os.path.getsize(path)
+        if size <= 0:
+            return "PDF 为空"
+        with open(path, "rb") as stream:
+            if stream.read(5) != b"%PDF-":
+                return "PDF 头无效"
+            stream.seek(max(0, size - 4096))
+            if b"%%EOF" not in stream.read():
+                return "PDF 尚未完整写入（缺少 EOF）"
+    except OSError as exc:
+        return f"PDF 无法读取：{exc}"
+
+    pages = pdf_page_count(path)
+    if pages is None:
+        return "PDF 页数无法验证"
+    if pages <= 0:
+        return "PDF 不含可读取页面"
+    if expected_pages is not None:
+        if pages != expected_pages:
+            return f"PDF 页数 {pages} != 版数 {expected_pages}"
+    return None
+
+
+def wait_for_complete_pdf(
+        pdf_path, expected_pages, timeout_seconds=180, poll_seconds=1.0,
+        process=None):
+    """Wait for a stable, structurally complete PDF without a size heuristic."""
+    deadline = time.monotonic() + timeout_seconds
+    stable = 0
+    previous = -1
+    validation_error = "PDF 尚未生成"
+    while time.monotonic() < deadline:
+        try:
+            size = os.path.getsize(pdf_path)
+        except OSError:
+            size = -1
+        if size > 0 and size == previous:
+            stable += 1
+        else:
+            stable = 0
+        previous = size
+        if stable >= 2:
+            validation_error = validate_pdf_artifact(
+                pdf_path, expected_pages=expected_pages
+            )
+            if validation_error is None:
+                return True, None
+            if process is not None and process.poll() is not None:
+                return False, validation_error
+        time.sleep(poll_seconds)
+    return False, validation_error
 
 
 def update_latest_link(out_dir, d, pdf_name):
@@ -548,21 +619,12 @@ def generate_epaper(out_dir, d, force=False):
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL,
                                 start_new_session=(os.name == "posix"))
-        complete, stable, previous = False, 0, -1
+        complete = False
+        validation_error = "PDF 尚未生成"
         try:
-            deadline = time.monotonic() + 180
-            while time.monotonic() < deadline:
-                if os.path.exists(pdf_path):
-                    size = os.path.getsize(pdf_path)
-                    if size > 100 * 1024 and size == previous:
-                        stable += 1
-                        if stable >= 3:
-                            complete = True
-                            break
-                    else:
-                        stable = 0
-                    previous = size
-                time.sleep(1.0)
+            complete, validation_error = wait_for_complete_pdf(
+                pdf_path, expected_pages=len(files), process=proc
+            )
         finally:
             if os.name == "posix":
                 try:
@@ -571,21 +633,16 @@ def generate_epaper(out_dir, d, force=False):
                     pass
         if not complete or not os.path.exists(pdf_path):
             return {"status": "pdf_failed", "dir": ep_dir,
-                    "note": "PDF 渲染超时或失败", "qihao": qihao}
+                    "note": f"PDF 渲染失败：{validation_error}", "qihao": qihao}
         try:
             os.remove(doc_p)
         except OSError:
             pass
-        with open(pdf_path, "rb") as f:
-            if f.read(5) != b"%PDF-":
-                return {"status": "pdf_failed", "dir": ep_dir, "note": "PDF 头无效"}
         result = {"status": "ok", "dir": ep_dir, "pdf": pdf_name,
                   "pages": len(files), "qihao": qihao}
         actual = pdf_page_count(pdf_path)
         if actual is not None:
             result["pages_actual"] = actual
-            if actual != len(files):
-                result["warn"] = f"PDF 页数 {actual} != 版数 {len(files)}，请人工复核"
         return result
     finally:
         shutil.rmtree(tmpd, ignore_errors=True)

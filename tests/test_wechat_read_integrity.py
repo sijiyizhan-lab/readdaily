@@ -58,6 +58,145 @@ def page_jpeg(width=1280, height=1823, fill=b"A", complete=True):
 
 
 class WechatGuideIntegrityTests(unittest.TestCase):
+    def test_small_complete_pdf_is_accepted_without_arbitrary_size_floor(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            pdf = Path(temporary) / "small.pdf"
+            pdf.write_bytes(
+                b"%PDF-1.4\n"
+                b"1 0 obj << /Type /Page >> endobj\n"
+                b"2 0 obj << /Type /Page >> endobj\n"
+                b"%%EOF\n"
+            )
+            with mock.patch.object(
+                wechat_engine.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(
+                    args=["mdls"], returncode=0, stdout="(null)\n", stderr=""
+                ),
+            ):
+                error = wechat_engine.validate_pdf_artifact(
+                    str(pdf), expected_pages=2
+                )
+
+        self.assertIsNone(error)
+
+    def test_pdf_completion_rejects_missing_eof_and_wrong_page_count(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            pdf = Path(temporary) / "partial.pdf"
+            pdf.write_bytes(b"%PDF-1.4\n1 0 obj << /Type /Page >> endobj\n")
+            self.assertIn(
+                "EOF", wechat_engine.validate_pdf_artifact(str(pdf), expected_pages=1)
+            )
+            pdf.write_bytes(
+                b"%PDF-1.4\n1 0 obj << /Type /Page >> endobj\n%%EOF\n"
+            )
+            with mock.patch.object(
+                wechat_engine.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(
+                    args=["mdls"], returncode=0, stdout="(null)\n", stderr=""
+                ),
+            ):
+                self.assertIn(
+                    "页数 1 != 版数 2",
+                    wechat_engine.validate_pdf_artifact(
+                        str(pdf), expected_pages=2
+                    ),
+                )
+
+    def test_small_stable_pdf_finishes_polling_without_waiting_for_size(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            pdf = Path(temporary) / "small-but-complete.pdf"
+            pdf.write_bytes(
+                b"%PDF-1.4\n"
+                + b"\n".join(
+                    b"%d 0 obj << /Type /Page >> endobj" % number
+                    for number in range(1, 9)
+                )
+                + b"\n%%EOF\n"
+            )
+            with mock.patch.object(
+                wechat_engine.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(
+                    args=["mdls"], returncode=0, stdout="(null)\n", stderr=""
+                ),
+            ), mock.patch.object(wechat_engine.time, "sleep") as sleep:
+                complete, error = wechat_engine.wait_for_complete_pdf(
+                    str(pdf), expected_pages=8, timeout_seconds=1, poll_seconds=0
+                )
+
+        self.assertTrue(complete)
+        self.assertIsNone(error)
+        self.assertLessEqual(sleep.call_count, 2)
+
+    def test_stable_partial_pdf_keeps_waiting_while_renderer_is_running(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            pdf = Path(temporary) / "rendering.pdf"
+            pdf.write_bytes(b"%PDF-1.4\n1 0 obj << /Type /Page >> endobj\n")
+            renderer = mock.Mock()
+            renderer.poll.return_value = None
+            sleep_count = 0
+
+            def finish_after_long_pause(_seconds):
+                nonlocal sleep_count
+                sleep_count += 1
+                if sleep_count == 7:
+                    pdf.write_bytes(
+                        b"%PDF-1.4\n1 0 obj << /Type /Page >> endobj\n%%EOF\n"
+                    )
+
+            with mock.patch.object(
+                wechat_engine.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(
+                    args=["mdls"], returncode=0, stdout="(null)\n", stderr=""
+                ),
+            ), mock.patch.object(
+                wechat_engine.time,
+                "monotonic",
+                side_effect=[0.0] + ([0.1] * 12) + [2.0],
+            ), mock.patch.object(
+                wechat_engine.time, "sleep", side_effect=finish_after_long_pause
+            ) as sleep:
+                complete, error = wechat_engine.wait_for_complete_pdf(
+                    str(pdf),
+                    expected_pages=1,
+                    timeout_seconds=1,
+                    poll_seconds=0,
+                    process=renderer,
+                )
+
+        self.assertTrue(complete)
+        self.assertIsNone(error)
+        self.assertGreater(sleep.call_count, 5)
+        self.assertGreater(renderer.poll.call_count, 0)
+
+    def test_stable_invalid_pdf_fails_quickly_after_renderer_exits(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            pdf = Path(temporary) / "failed-render.pdf"
+            pdf.write_bytes(b"%PDF-1.4\n1 0 obj << /Type /Page >> endobj\n")
+            renderer = mock.Mock()
+            renderer.poll.return_value = 1
+
+            with mock.patch.object(
+                wechat_engine.time,
+                "monotonic",
+                side_effect=[0.0, 0.1, 0.2, 0.3, 2.0],
+            ), mock.patch.object(wechat_engine.time, "sleep") as sleep:
+                complete, error = wechat_engine.wait_for_complete_pdf(
+                    str(pdf),
+                    expected_pages=1,
+                    timeout_seconds=1,
+                    poll_seconds=0,
+                    process=renderer,
+                )
+
+        self.assertFalse(complete)
+        self.assertIn("EOF", error)
+        self.assertEqual(sleep.call_count, 2)
+        renderer.poll.assert_called_once_with()
+
     def test_guide_parser_rejects_partial_page_image_set_instead_of_truncating_rows(self):
         with tempfile.TemporaryDirectory() as temporary:
             html_path = Path(temporary) / "article.html"

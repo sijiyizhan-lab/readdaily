@@ -35,7 +35,7 @@ python3 <bundle-or-repo>/skills/newspaper-fetch/scripts/fetch.py --registry <bun
 open "dist/Read Daily.app"
 ```
 
-默认产物是 `dist/Read Daily.app`，并同时生成可上传 GitHub Release 的 `dist/Read-Daily-v0.3.2-macOS-arm64.zip` 与 `.sha256`。也可传入一个以 `.app` 结尾的输出路径：
+默认产物是 `dist/Read Daily.app`，并同时生成可上传 GitHub Release 的 `dist/Read-Daily-v0.3.3-macOS-arm64.zip` 与 `.sha256`。也可传入一个以 `.app` 结尾的输出路径：
 
 ```bash
 ./scripts/build_macos_app.sh "$HOME/Desktop/Read Daily.app"
@@ -80,7 +80,7 @@ swift test --package-path apps/ConstructionReadingDesk --enable-swift-testing --
 swift build --package-path apps/ConstructionReadingDesk -c release
 ```
 
-测试覆盖版本化 Codable、真实 API 载荷映射、进程命令参数、严格 stdout JSON、中文错误、复核编辑状态、异步版图换页、真实挂起抓取期间的同日切报与换版、迟到输入隔离、阅读状态合并、缓存失效与响应式/可访问性策略。v0.3.2 发布基线为 103 项 Swift 测试（13 个套件）与仓库级 354 项 Python 测试。
+测试覆盖版本化 Codable、真实 API 载荷映射、进程命令参数、严格 stdout JSON、中文错误、复核编辑状态、异步版图换页、真实挂起抓取期间的同日切报与换版、迟到输入隔离、阅读状态合并、缓存失效与响应式/可访问性策略。v0.3.3 发布基线为 105 项 Swift 测试（13 个套件）与仓库级 372 项 Python 测试。
 
 ## 边界
 

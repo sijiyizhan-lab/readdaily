@@ -115,6 +115,19 @@ struct ReadDailyCommandTests {
         #expect(!request.arguments.contains("--source"))
     }
 
+    @Test("仅补抓失败报纸使用一个逗号分隔的来源参数")
+    func failedSourceRetryUsesSingleSourceFilter() throws {
+        let request = try ReadDailyCommandFactory(configuration: configuration).make(
+            .fetchSources(date: "2026-09-03", sourceIDs: ["bjrb", "rmrb", "unknown", "rmrb"])
+        )
+
+        #expect(request.arguments == [
+            "/Users/test/readdaily/skills/newspaper-fetch/scripts/fetch.py",
+            "--registry", "/Users/test/readdaily/skills/newspaper-fetch/sources.json",
+            "--source", "rmrb,bjrb", "--date", "2026-09-03",
+        ])
+    }
+
     @Test("中国建设报抓取直接调用包内抓取器并保留来源范围")
     func constructionFetchUsesDirectFetcherAndRegistry() throws {
         let request = try ReadDailyCommandFactory(configuration: configuration).make(

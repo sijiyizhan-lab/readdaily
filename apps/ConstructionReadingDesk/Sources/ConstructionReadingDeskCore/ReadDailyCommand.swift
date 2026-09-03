@@ -63,6 +63,7 @@ public enum ReadDailyAPICommand: Equatable, Sendable {
         expectedRevision: Int? = nil
     )
     case fetchDaily(date: String)
+    case fetchSources(date: String, sourceIDs: [String])
     case fetchConstruction(date: String? = nil)
 }
 
@@ -123,6 +124,22 @@ public struct ReadDailyCommandFactory: Sendable {
                 environment: environment
             )
         }
+        if case .fetchSources(let date, let sourceIDs) = command {
+            let normalized = NewspaperRegistry.dailySources
+                .map(\.id)
+                .filter { sourceIDs.contains($0) }
+            guard !normalized.isEmpty else {
+                throw CommandFactoryError.emptyIdentifier("补抓报纸")
+            }
+            var arguments = fetchArguments
+            arguments += ["--source", normalized.joined(separator: ",")]
+            append("--date", date, to: &arguments)
+            return ProcessRequest(
+                executableURL: configuration.pythonExecutableURL,
+                arguments: arguments,
+                environment: environment
+            )
+        }
 
         let workbenchScript = configuration.repositoryURL
             .appendingPathComponent("skills/newspaper-reader/scripts/workbench_api.py").path
@@ -157,7 +174,7 @@ public struct ReadDailyCommandFactory: Sendable {
             append("--date", date, to: &arguments)
             append("--status", status.rawValue, to: &arguments)
             append("--expected-reading-revision", expectedRevision.map(String.init), to: &arguments)
-        case .fetchDaily, .fetchConstruction:
+        case .fetchDaily, .fetchSources, .fetchConstruction:
             break
         }
 
@@ -197,7 +214,7 @@ private extension ReadDailyAPICommand {
         case .history: return "history"
         case .rollback: return "rollback"
         case .readingMark: return "reading-mark"
-        case .fetchDaily: return "fetch"
+        case .fetchDaily, .fetchSources: return "fetch"
         case .fetchConstruction: return "fetch"
         }
     }

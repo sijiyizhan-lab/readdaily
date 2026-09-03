@@ -28,7 +28,7 @@ struct PayloadMapperTests {
 
     @Test("新 dashboard 结构映射固定分类、缺报和真实阅读状态")
     func mapsDailyDashboardRegistryShape() throws {
-        let data = try payload(#"{"date":"2026-09-03","categories":[{"id":"central_party","name":"中央党报","newspapers":[{"source":"rmrb","source_name":"人民日报","category_id":"central_party","date":"2026-09-03","available":true,"acquisition_status":"complete","reading_status":"completed","issue_no":"123"},{"source":"gmrb","source_name":"光明日报","category_id":"central_party","date":"2026-09-03","available":false,"acquisition_status":"pending","reading_status":"unread"}]}],"newspapers":[],"stats":{"expected_count":8,"available_count":1}}"#)
+        let data = try payload(#"{"date":"2026-09-03","categories":[{"id":"central_party","name":"中央党报","newspapers":[{"source":"rmrb","source_name":"人民日报","category_id":"central_party","date":"2026-09-03","available":true,"acquisition_status":"complete","reading_status":"completed","issue_no":"123"},{"source":"gmrb","source_name":"光明日报","category_id":"central_party","date":"2026-09-03","available":false,"acquisition_status":"failed","failure_message":"正文容器变化","warnings":["兼容告警"],"reading_status":"unread"}]}],"newspapers":[],"stats":{"expected_count":8,"available_count":1}}"#)
 
         let day = try WorkbenchPayloadMapper().dailyDashboard(from: data)
         let entries = day.sections.flatMap(\.entries)
@@ -36,7 +36,8 @@ struct PayloadMapperTests {
         #expect(day.date == "2026-09-03")
         #expect(entries.count == 8)
         #expect(entries.first(where: { $0.source.id == "rmrb" })?.readingStatus == .completed)
-        #expect(entries.first(where: { $0.source.id == "gmrb" })?.status == .notStarted)
+        #expect(entries.first(where: { $0.source.id == "gmrb" })?.status == .failed)
+        #expect(entries.first(where: { $0.source.id == "gmrb" })?.statusDetail == "正文容器变化")
     }
 
     @Test("期次按版面单元映射原图、OCR、摘要、主题和事实")

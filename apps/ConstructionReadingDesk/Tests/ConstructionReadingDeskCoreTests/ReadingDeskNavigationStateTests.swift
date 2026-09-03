@@ -99,7 +99,8 @@ struct ReadingDeskNavigationStateTests {
             source: "zgjsb",
             date: TestEnvironment.today
         ) == issueRequestsBeforeFetch)
-        #expect(viewModel.notice == "抓取完成；当前未保存编辑已保留，请保存后再刷新本报。")
+        #expect(viewModel.notice?.contains("当前未保存编辑已保留") == true)
+        #expect(viewModel.noticeSeverity == .warning)
         #expect(viewModel.presentedError == nil)
     }
 

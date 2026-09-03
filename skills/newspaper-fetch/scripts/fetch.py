@@ -52,7 +52,7 @@ PIPELINE_CONTRACT_VERSION = 1
 # changes.  Existing timestamps then lose skip eligibility automatically.
 ADAPTER_CONTRACT_VERSIONS = {
     "cms_index": 1,
-    "founder": 1,
+    "founder": 2,
     "mobile_epaper": 1,
     "paper_api": 1,
     "pdf_site": 1,
@@ -60,8 +60,8 @@ ADAPTER_CONTRACT_VERSIONS = {
 }
 PARSER_CONTRACT_VERSIONS = {
     "cms_index": 1,
-    "founder": 1,
-    "mobile_epaper": 1,
+    "founder": 2,
+    "mobile_epaper": 2,
     "paper_api": 1,
     "pdf_site": 1,
     "wechat_read": 1,

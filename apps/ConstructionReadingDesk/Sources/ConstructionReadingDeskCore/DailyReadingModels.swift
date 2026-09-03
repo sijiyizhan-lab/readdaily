@@ -125,6 +125,7 @@ public struct DailyNewspaperEntry: Equatable, Identifiable, Sendable {
     public let status: DailyRunStatus
     public let readingStatus: ReadingCompletionStatus
     public let readingRevision: Int
+    public let failureMessage: String?
 
     public var id: String { source.id }
 
@@ -133,15 +134,24 @@ public struct DailyNewspaperEntry: Equatable, Identifiable, Sendable {
         issue: IssueSummary?,
         status: DailyRunStatus? = nil,
         readingStatus: ReadingCompletionStatus? = nil,
-        readingRevision: Int = 0
+        readingRevision: Int = 0,
+        failureMessage: String? = nil
     ) {
+        let resolvedStatus = status ?? DailyRunStatus.from(issue: issue)
         self.source = source
         self.issue = issue
-        self.status = status ?? DailyRunStatus.from(issue: issue)
+        self.status = resolvedStatus
         self.readingStatus = readingStatus
             ?? issue?.readingStatus.flatMap(ReadingCompletionStatus.init(rawValue:))
             ?? .unread
         self.readingRevision = max(0, readingRevision)
+        self.failureMessage = failureMessage
+            ?? (resolvedStatus == .failed ? issue?.warnings.first : nil)
+    }
+
+    public var statusDetail: String {
+        let detail = failureMessage?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return detail.isEmpty ? status.accessibleLabel : detail
     }
 }
 
@@ -166,6 +176,38 @@ public struct DailyReadingDay: Equatable, Identifiable, Sendable {
         self.date = date
         self.sections = sections
         self.availableDates = availableDates
+    }
+}
+
+public struct FetchRunSummary: Equatable, Sendable {
+    public let date: String
+    public let entries: [DailyNewspaperEntry]
+
+    public init(day: DailyReadingDay) {
+        date = day.date
+        entries = day.entries
+    }
+
+    public var successfulCount: Int {
+        entries.filter { $0.status.isAvailable }.count
+    }
+
+    public var retryableEntries: [DailyNewspaperEntry] {
+        entries.filter { $0.status == .failed || $0.status == .notStarted }
+    }
+
+    public var retryableSourceIDs: [String] {
+        NewspaperRegistry.dailySources.compactMap { source in
+            retryableEntries.contains { $0.source.id == source.id } ? source.id : nil
+        }
+    }
+
+    public var failedSourceNames: [String] {
+        retryableEntries.map(\.source.name)
+    }
+
+    public var isComplete: Bool {
+        successfulCount == NewspaperRegistry.dailySources.count && retryableEntries.isEmpty
     }
 }
 

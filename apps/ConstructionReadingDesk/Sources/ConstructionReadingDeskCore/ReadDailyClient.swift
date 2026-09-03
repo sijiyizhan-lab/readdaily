@@ -218,6 +218,11 @@ public actor ReadDailyClient {
         return try await performRawFetch(request)
     }
 
+    public func fetchSources(date: String, sourceIDs: [String]) async throws -> String {
+        let request = try validatedRequest(for: .fetchSources(date: date, sourceIDs: sourceIDs))
+        return try await performRawFetch(request)
+    }
+
     private func performRawFetch(_ request: ProcessRequest) async throws -> String {
         let result = try await runner.run(request)
         guard result.terminationStatus == 0 else {

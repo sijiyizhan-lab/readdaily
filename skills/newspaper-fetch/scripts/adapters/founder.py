@@ -59,19 +59,75 @@ def _hrefs(document):
     ]
 
 
+def _attribute_value(opening_tag, name):
+    """Read a quoted or HTML-valid unquoted attribute value."""
+    match = re.search(
+        r'\b%s\s*=\s*(?:(["\'])(.*?)\1|([^\s"\'=<>`]+))'
+        % re.escape(name),
+        opening_tag or "",
+        re.I | re.S,
+    )
+    return (match.group(2) or match.group(3)) if match else None
+
+
 def _container_tail(document, identifiers):
-    accepted = {identifier.lower() for identifier in identifiers}
-    for match in re.finditer(r'<(?:article|div|section)\b[^>]*>', document or "", re.I):
-        identifier = re.search(
-            r'\bid\s*=\s*(["\'])(.*?)\1', match.group(0), re.I | re.S
-        )
-        if identifier and identifier.group(2).strip().lower() in accepted:
-            return document[match.end():]
+    """Return the bounded contents of an explicitly identified body container."""
+    for accepted in (identifier.lower() for identifier in identifiers):
+        for match in re.finditer(
+                r'<(?:article|div|section)\b[^>]*>', document or "", re.I):
+            identifier = _attribute_value(match.group(0), "id")
+            classes = _attribute_value(match.group(0), "class") or ""
+            if (str(identifier or "").strip().lower() != accepted
+                    and accepted not in {
+                        token.lower() for token in classes.split()
+                    }):
+                continue
+
+            root_tag = re.match(
+                r'<\s*([A-Za-z0-9]+)', match.group(0)
+            ).group(1).lower()
+            stack = [root_tag]
+            for token in re.finditer(
+                    r'<\s*(/?)\s*([A-Za-z0-9]+)\b[^>]*>',
+                    document[match.end():], re.I | re.S):
+                closing, tag = token.group(1), token.group(2).lower()
+                absolute_start = match.end() + token.start()
+                raw_tag = token.group(0)
+                if closing:
+                    if tag not in stack:
+                        continue
+                    matching_index = len(stack) - 1 - stack[::-1].index(tag)
+                    del stack[matching_index:]
+                    if not stack:
+                        return document[match.end():absolute_start]
+                elif (not raw_tag.rstrip().endswith("/>")
+                      and tag not in {"area", "base", "br", "col", "embed", "hr",
+                                      "img", "input", "link", "meta", "param",
+                                      "source", "track", "wbr"}):
+                    stack.append(tag)
     return None
 
 
 def _article_title(document):
     """Extract a complete headline without arbitrary character cutoffs."""
+    for opening in re.finditer(r'<([A-Za-z0-9]+)\b[^>]*>', document or "", re.I):
+        identifier = _attribute_value(opening.group(0), "id")
+        classes = _attribute_value(opening.group(0), "class") or ""
+        if not (
+            str(identifier or "").strip().lower() == "title"
+            or "title" in {token.lower() for token in classes.split()}
+        ):
+            continue
+        closing = re.search(
+            r'</\s*%s\s*>' % re.escape(opening.group(1)),
+            document[opening.end():], re.I,
+        )
+        if closing:
+            fragment = document[opening.end():opening.end() + closing.start()]
+            title = re.sub(r"<[^>]+>", " ", fragment)
+            title = re.sub(r"\s+", " ", html_module.unescape(title)).strip()
+            if title:
+                return title.strip(" \u201c\u201d")
     match = re.search(r"<h1\b[^>]*>(.*?)</h1\s*>", document or "", re.I | re.S)
     if match:
         title = re.sub(r"<[^>]+>", " ", match.group(1))
@@ -253,13 +309,23 @@ def _document_dates(html):
     return _dates_in_text("\n".join(evidence))
 
 
+def _document_title_dates(html):
+    """Extract the strongest in-document date evidence from the page title."""
+    title = re.search(r"<title[^>]*>(.*?)</title>", html or "", re.I | re.S)
+    return _dates_in_text(title.group(1)) if title else set()
+
+
 def _response_date_error(requested_day, requested_url, final_url, html):
     """Return a reason when a successful response cannot prove the target day."""
     final_dates = _dates_in_text(final_url)
     document_dates = _document_dates(html)
+    title_dates = _document_title_dates(html)
     if final_dates and final_dates != {requested_day}:
         return "响应跳转日期与请求日期 %s 不一致" % requested_day.isoformat()
-    if document_dates and requested_day not in document_dates:
+    if title_dates and requested_day not in title_dates:
+        return "页面内容日期与请求日期 %s 不一致" % requested_day.isoformat()
+    if (document_dates and requested_day not in document_dates
+            and final_dates != {requested_day}):
         return "页面内容日期与请求日期 %s 不一致" % requested_day.isoformat()
     requested_dates = _dates_in_text(requested_url)
     if requested_day not in final_dates and requested_day not in document_dates:
@@ -350,6 +416,8 @@ def fetch(src, d, archive_root, with_text=False, max_articles=12):
 
     # 1) 版页清单：优先 index_url（从索引页发现 node_XX 链接+版名）
     pages = []
+    prefetched_pages = {}
+    max_pages = int(src.get("max_pages", 20))
     if src.get("index_url"):
         try:
             st, _, raw = lib.http_get(src["index_url"], referer=src.get("entry"))
@@ -367,10 +435,17 @@ def fetch(src, d, archive_root, with_text=False, max_articles=12):
                 label = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', '', inner)).strip()
                 mm = re.search(r'第\s*(\S+?)\s*版\s*(.{1,14})', label)
                 if mm:
-                    page_match = re.search(r'node_(\d+)', resolved, re.I)
+                    page_match = re.search(
+                        r'node_([A-Za-z]{0,4}\d{2})\.html(?:[?#]|$)',
+                        resolved, re.I,
+                    )
                     if not page_match:
                         return None, "静态索引版面链接缺少可验证版号；整期未归档"
-                    pages.append((resolved, int(page_match.group(1)), mm.group(1),
+                    edition_code = page_match.group(1).upper()
+                    displayed_code = mm.group(1).upper()
+                    if displayed_code != edition_code:
+                        return None, "静态索引版号与版面链接不一致；整期未归档"
+                    pages.append((resolved, edition_code,
                                   re.sub(r'\s+', '', mm.group(2))))
         except lib.PIPELINE_FATAL_EXCEPTIONS:
             raise
@@ -378,30 +453,135 @@ def fetch(src, d, archive_root, with_text=False, max_articles=12):
             return None, "静态索引读取失败，无法确认请求日期 %s" % d.isoformat()
         if not pages:
             return None, "静态索引无法确认请求日期 %s（当日缺报）" % d.isoformat()
-        pages_by_number = {}
+        page_directory = None
+        pages_by_code = {}
         for page in pages:
-            page_url, page_number = page[0], page[1]
-            existing = pages_by_number.get(page_number)
-            if existing and existing[0] != page_url:
-                return None, "静态索引存在重复版号 %s；整期未归档" % page_number
-            pages_by_number[page_number] = page
-        pages = [pages_by_number[number] for number in sorted(pages_by_number)]
-        page_numbers = [page[1] for page in pages]
-        if page_numbers != list(range(1, len(page_numbers) + 1)):
-            return None, "静态索引版号必须从1连续排列；整期未归档"
+            page_url, edition_code = page[0], page[1]
+            parsed_url = urlparse(page_url)
+            directory = (
+                parsed_url.scheme.lower(), parsed_url.netloc.lower(),
+                parsed_url.path.rsplit("/", 1)[0],
+            )
+            if page_directory is None:
+                page_directory = directory
+            elif directory != page_directory:
+                return None, "静态索引版面链接不在同一目录；整期未归档"
+            if edition_code in pages_by_code:
+                return None, "静态索引存在重复版号 %s；整期未归档" % edition_code
+            pages_by_code[edition_code] = page
+        numeric_codes = all(code.isdigit() for code in pages_by_code)
+        if numeric_codes:
+            page_numbers = [int(page[1]) for page in pages]
+            if sorted(page_numbers) != list(range(1, len(page_numbers) + 1)):
+                return None, "静态索引版号必须从1连续排列；整期未归档"
+            pages.sort(key=lambda page: int(page[1]))
+        pages = [
+            (page_url, ordinal, edition_code, fallback_name)
+            for ordinal, (page_url, edition_code, fallback_name)
+            in enumerate(pages, 1)
+        ]
     else:
-        try:
-            base, n = _probe_pages(src, d)
-        except lib.PIPELINE_FATAL_EXCEPTIONS:
-            raise
-        except RuntimeError as exc:
-            return None, str(exc)
-        if not base:
-            return None, f"当日无可用版面（node_tpl={src.get('node_tpl')}）"
-        pages = [(_fmt(src["node_tpl"], d, p), p, f"{p:02d}", f"第{p}版")
-                 for p in range(1, n + 1)]
+        if src.get("discover_from_first_nav"):
+            first_url = _fmt(src["node_tpl"], d, 1)
+            try:
+                st, final_url, raw = lib.http_get(
+                    first_url, referer=src.get("entry")
+                )
+            except lib.PIPELINE_FATAL_EXCEPTIONS:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                return None, "首版导航访问异常：%s" % exc
+            if st != 200:
+                return None, "首版导航访问失败 %s；整期未归档" % st
+            h = _best(raw)
+            date_error = _response_date_error(d, first_url, final_url, h)
+            if date_error:
+                return None, "首版%s；整期未归档" % date_error
+            first_parsed = urlparse(final_url)
+            first_directory = (
+                first_parsed.scheme.lower(), first_parsed.netloc.lower(),
+                first_parsed.path.rsplit("/", 1)[0],
+            )
+            discovered = {}
+            for href in _hrefs(h):
+                resolved = urljoin(final_url, href)
+                match = re.search(r'node_(\d{2})\.html(?:[?#]|$)', resolved, re.I)
+                if not match:
+                    continue
+                parsed_url = urlparse(resolved)
+                directory = (
+                    parsed_url.scheme.lower(), parsed_url.netloc.lower(),
+                    parsed_url.path.rsplit("/", 1)[0],
+                )
+                # The desktop page also links to a parallel mobile/pad reader.
+                # It is not part of this edition inventory, so ignore it rather
+                # than rejecting an otherwise complete same-directory sequence.
+                if directory != first_directory:
+                    continue
+                if _dates_in_text(resolved) != {d}:
+                    return None, "首版导航含日期不一致的版面链接；整期未归档"
+                number = int(match.group(1))
+                if number in discovered and discovered[number] != resolved:
+                    return None, "首版导航存在重复版号 %s；整期未归档" % number
+                discovered[number] = resolved
+            if discovered and sorted(discovered) == list(range(1, len(discovered) + 1)):
+                if len(discovered) > max_pages:
+                    return None, (
+                        "首版导航发现 %s 版，超过配置上限 %s；"
+                        "为避免缺版已拒绝归档"
+                        % (len(discovered), max_pages)
+                    )
+                next_number = len(discovered) + 1
+                next_url = _fmt(src["node_tpl"], d, next_number)
+                try:
+                    next_status, next_final_url, next_raw = lib.http_get(
+                        next_url, referer=src.get("entry")
+                    )
+                except lib.PIPELINE_FATAL_EXCEPTIONS:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    return None, "首版导航末版确认异常：%s；整期未归档" % exc
+                if next_status == 200:
+                    next_html = _best(next_raw)
+                    next_date_error = _response_date_error(
+                        d, next_url, next_final_url, next_html
+                    )
+                    if next_date_error:
+                        return None, "首版导航后续第%s版%s；整期未归档" % (
+                            next_number, next_date_error
+                        )
+                    if next_number > max_pages:
+                        return None, (
+                            "版次超过配置上限 %s；为避免缺版已拒绝归档"
+                            % max_pages
+                        )
+                    return None, (
+                        "首版导航仅列出前%s版，但第%s版仍存在；"
+                        "导航不完整，整期未归档"
+                        % (len(discovered), next_number)
+                    )
+                if next_status not in (404, 410):
+                    return None, "首版导航末版确认失败 %s；整期未归档" % next_status
+                pages = [
+                    (discovered[number], number, "%02d" % number, "第%s版" % number)
+                    for number in range(1, len(discovered) + 1)
+                ]
+                prefetched_pages[first_url] = (final_url, raw, h)
+                prefetched_pages[final_url] = (final_url, raw, h)
+            elif discovered:
+                return None, "首版导航版号必须从1连续排列；整期未归档"
+        if not pages:
+            try:
+                base, n = _probe_pages(src, d)
+            except lib.PIPELINE_FATAL_EXCEPTIONS:
+                raise
+            except RuntimeError as exc:
+                return None, str(exc)
+            if not base:
+                return None, f"当日无可用版面（node_tpl={src.get('node_tpl')}）"
+            pages = [(_fmt(src["node_tpl"], d, p), p, f"{p:02d}", f"第{p}版")
+                     for p in range(1, n + 1)]
 
-    max_pages = int(src.get("max_pages", 20))
     if len(pages) > max_pages:
         return None, "静态索引发现 %s 版，超过配置上限 %s；为避免缺版已拒绝归档" % (
             len(pages), max_pages
@@ -409,16 +589,21 @@ def fetch(src, d, archive_root, with_text=False, max_articles=12):
     expected_pages = list(pages)
     editions, all_units = [], []
     page_downloads = []
-    for u, no_ord, label, fallback_name in expected_pages:
+    for u, no_ord, edition_code, fallback_name in expected_pages:
+        cached = prefetched_pages.get(u)
         try:
-            st, final_url, raw = lib.http_get(u, referer=src.get("entry"))
+            if cached is not None:
+                final_url, raw, h = cached
+                st = 200
+            else:
+                st, final_url, raw = lib.http_get(u, referer=src.get("entry"))
+                h = _best(raw) if st == 200 else ""
         except lib.PIPELINE_FATAL_EXCEPTIONS:
             raise
         except Exception as exc:  # noqa: BLE001
             return None, "第%s版访问异常：%s" % (no_ord, exc)
         if st != 200:
             return None, "第%s版访问失败 %s；整期未归档" % (no_ord, st)
-        h = _best(raw)
         page_date_error = _response_date_error(d, u, final_url, h)
         if page_date_error:
             return None, "第%s版%s；整期未归档" % (no_ord, page_date_error)
@@ -547,10 +732,12 @@ def fetch(src, d, archive_root, with_text=False, max_articles=12):
             "page_image_width": page_image_meta["width"],
             "page_image_height": page_image_meta["height"],
             "url": u,
-            "label": label,
+            "label": edition_code,
+            "edition_code": edition_code,
         })
         all_units.append({"id": f"{src['id']}_{d.isoformat().replace('-', '')}_{no_ord:02d}",
                           "type": "article_text", "title": f"{no_ord}版 {name}",
+                          "edition_code": edition_code,
                           "url": u, "page_image": page_img,
                           "page_image_sha256": page_image_meta["sha256"],
                           "articles": arts})
@@ -639,9 +826,13 @@ def parse(src, d, archive_root, max_articles=8):
                 )
             # 标题
             title = _article_title(h)
-            # 正文：ozoom / articleContent 段落
+            # 正文：兼容各方正版式，但只接受精确 id/class token，且截断到
+            # 容器自身闭合标签，避免把相关推荐和页脚误当正文。
             paras = []
-            seg = _container_tail(h, ("ozoom", "articleContent"))
+            seg = _container_tail(
+                h,
+                ("ozoom", "articleContent", "m-article-main", "detail-art"),
+            )
             if seg is None:
                 return issue, "第%s版第%s篇文章缺少正文容器" % (
                     unit_index, article_index

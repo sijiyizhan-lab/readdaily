@@ -80,6 +80,11 @@ public struct WorkbenchPayloadMapper: Sendable {
                         )
                         let readingStatus = ReadingCompletionStatus(rawValue: row.string("reading_status") ?? "unread") ?? .unread
                         let warnings = row.strings("warnings")
+                        let failureMessage = row.string(
+                            "failure_message",
+                            "error_message",
+                            "failure_reason"
+                        ) ?? (status == .failed ? warnings.first : nil)
                         let issue: IssueSummary? = row.boolean("available") == false ? nil : IssueSummary(
                             id: row.string("id"),
                             sourceID: source.id,
@@ -97,7 +102,8 @@ public struct WorkbenchPayloadMapper: Sendable {
                             issue: issue,
                             status: status,
                             readingStatus: readingStatus,
-                            readingRevision: row.integer("reading_revision") ?? 0
+                            readingRevision: row.integer("reading_revision") ?? 0,
+                            failureMessage: failureMessage
                         )
                     }
             )

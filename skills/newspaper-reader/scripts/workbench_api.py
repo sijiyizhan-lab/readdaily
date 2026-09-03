@@ -1683,6 +1683,25 @@ def _has_active_failure(stages):
     return latest_success is None or failed_at >= latest_success
 
 
+def _active_failure_note(state):
+    """Return the current acquisition failure without surfacing stale notes.
+
+    Fetch state keeps the last human-readable failure in ``note``.  A later
+    successful stage makes that note historical, so callers must gate it with
+    the same timestamp rule used for status classification.
+    """
+    if not isinstance(state, dict):
+        return None
+    stages = state.get("stages") or {}
+    if not isinstance(stages, dict) or not _has_active_failure(stages):
+        return None
+    note = state.get("note")
+    if not isinstance(note, str):
+        return None
+    note = note.strip()
+    return note or None
+
+
 def _publication_matches_evidence(state, issue):
     stages = state.get("stages") if isinstance(state, dict) else None
     if not isinstance(stages, dict) or not (
@@ -1749,6 +1768,7 @@ def _get_inbox_in_session(archive_root, day=None, source=None):
             continue
         state = _load_state(archive, source, issue_day)
         stages = state.get("stages") or {}
+        failure_note = _active_failure_note(state)
         require_publication_evidence = bool(
             source == CONSTRUCTION_SOURCE
             and (stages.get("published") or stages.get("archived"))
@@ -1805,12 +1825,14 @@ def _get_inbox_in_session(archive_root, day=None, source=None):
             "status": status,
             "review_status": review_status,
             "publish_status": publish_status,
+            "failure_message": failure_note,
             "text_length": issue["text_length"],
             "coverage": issue["coverage"],
             "pdf_path": issue.get("pdf_path"),
             "warnings": list(dict.fromkeys(
                 issue["warnings"]
                 + list(state.get("warnings") or [])
+                + ([failure_note] if failure_note else [])
                 + (["既有发布记录对应旧版报纸证据，需重新复核发布"]
                    if (stages.get("published") or stages.get("archived"))
                    and not published else [])
@@ -2007,6 +2029,7 @@ def _get_daily_dashboard_in_session(archive_root, day=None, source=None):
         state = _load_state(archive_root, source_id, day)
         stages = state.get("stages") or {}
         active_failure = _has_active_failure(stages)
+        failure_note = _active_failure_note(state)
         issue_path = _issue_dir(archive_root, source_id, day) / "issue.json"
         issue = None
         load_error = None
@@ -2111,6 +2134,10 @@ def _get_daily_dashboard_in_session(archive_root, day=None, source=None):
             "issue_no": issue.get("issue_no") if issue else None,
             "review_status": review_status,
             "publish_status": publish_status,
+            "failure_message": (
+                failure_note or load_error
+                or ("报纸证据不完整" if evidence_incomplete else None)
+            ),
             "text_length": text_length,
             "edition_count": coverage["editions"],
             "coverage": coverage,
@@ -2119,6 +2146,7 @@ def _get_daily_dashboard_in_session(archive_root, day=None, source=None):
             "warnings": list(dict.fromkeys(
                 ((issue.get("warnings") or []) if issue else [])
                 + (list(state.get("warnings") or []))
+                + ([failure_note] if failure_note else [])
                 + ([source_updating] if source_updating else [])
                 + ([load_error] if load_error else [])
                 + (["既有发布记录对应旧版报纸证据，需重新复核发布"]

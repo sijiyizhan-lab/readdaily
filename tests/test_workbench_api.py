@@ -1631,7 +1631,8 @@ print(json.dumps(sorted(
             "stages": {
                 "parsed": "2026-08-31T10:00:00+08:00",
                 "failed": "2026-08-31T11:00:00+08:00",
-            }
+            },
+            "note": "正文容器变化，需要更新适配器",
         }), encoding="utf-8")
 
         result = api.get_daily_dashboard(self.archive, "2026-08-31")
@@ -1653,6 +1654,8 @@ print(json.dumps(sorted(
         self.assertEqual(missing["daily_actions"]["acquired"]["status"], "pending")
         failed = next(row for row in result["newspapers"] if row["source"] == "rmrb")
         self.assertEqual(failed["daily_actions"]["acquired"]["status"], "failed")
+        self.assertEqual(failed["failure_message"], "正文容器变化，需要更新适配器")
+        self.assertIn("正文容器变化，需要更新适配器", failed["warnings"])
         construction = next(row for row in result["newspapers"] if row["source"] == "zgjsb")
         self.assertTrue(construction["available"])
         self.assertEqual(construction["acquisition_status"], "complete")
@@ -1660,6 +1663,25 @@ print(json.dumps(sorted(
         self.assertIsNone(construction["last_read_at"])
         self.assertEqual(construction["daily_actions"]["acquired"]["status"], "complete")
         self.assertEqual(construction["daily_actions"]["read"]["status"], "pending")
+
+    def test_daily_dashboard_does_not_surface_stale_failure_note_after_success(self):
+        self.write_issue(source="rmrb", source_name="人民日报", issue_no="30100")
+        state_dir = self.archive / "_state" / "rmrb"
+        state_dir.mkdir(parents=True)
+        (state_dir / "2026-08-31.json").write_text(json.dumps({
+            "stages": {
+                "failed": "2026-08-31T09:00:00+08:00",
+                "parsed": "2026-08-31T10:00:00+08:00",
+            },
+            "note": "旧失败，不应继续显示",
+        }), encoding="utf-8")
+
+        result = api.get_daily_dashboard(self.archive, "2026-08-31")
+        row = next(item for item in result["newspapers"] if item["source"] == "rmrb")
+
+        self.assertNotEqual(row["status"], "failed")
+        self.assertIsNone(row["failure_message"])
+        self.assertNotIn("旧失败，不应继续显示", row["warnings"])
 
     def test_daily_dashboard_defaults_to_latest_locked_source_date_and_lists_available_dates(self):
         self.write_issue(source="rmrb", source_name="人民日报", day="2026-08-30")
