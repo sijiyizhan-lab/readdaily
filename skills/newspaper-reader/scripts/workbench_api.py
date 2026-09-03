@@ -15,7 +15,6 @@ from pathlib import Path
 import re
 import stat
 import sys
-import tempfile
 import threading
 
 
@@ -43,7 +42,9 @@ DEFAULT_VAULT = os.environ.get("READDAILY_VAULT") or os.path.expanduser(
     "~/Library/Application Support/readdaily/vault"
 )
 SOURCE_REGISTRY = HERE.parents[1] / "newspaper-fetch" / "sources.json"
-_SOURCE_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_SOURCE_RE = re.compile(
+    r"^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$"
+)
 _FACT_FIELDS = ("subject", "action", "object", "value", "unit", "time", "source")
 OCR_REVIEW_STATUSES = (
     "unreviewed", "edited", "confirmed",
@@ -96,6 +97,26 @@ class PathSafetyError(ValidationError):
     code = "path_safety_error"
 
 
+class SourceUpdatingError(APIError):
+    code = "source_updating"
+
+    def __init__(self, source, day):
+        self.source = str(source)
+        self.day = str(day)
+        super().__init__("%s %s 正在更新，请稍后重试" % (source, day))
+
+
+@contextlib.contextmanager
+def _source_evidence_read_lock(
+        archive_root, source, day, *, blocking):
+    try:
+        with vault_publisher._fetch_source_evidence_lock(
+                archive_root, source, day, blocking=blocking):
+            yield
+    except vault_publisher.SourceEvidenceBusyError as exc:
+        raise SourceUpdatingError(source, day) from exc
+
+
 class _ArchiveJSONTarget:
     """One archive-relative JSON target bound to a verified root inode."""
 
@@ -125,7 +146,10 @@ def _now():
 def _validate_source(source):
     source = str(source or "")
     if not _SOURCE_RE.fullmatch(source):
-        raise ValidationError("source 只能包含字母、数字、点、下划线和连字符")
+        raise ValidationError(
+            "source 必须是 1–64 位小写 ASCII slug（字母、数字、_、-），"
+            "且首尾必须为字母或数字"
+        )
     return source
 
 
@@ -201,35 +225,50 @@ def _archive_rmw_lock(archive_root, scope, archive_session=None):
         # directory inode is stable across such aliases and across processes.
         archive_identity = "inode:%s:%s" % (device, inode)
     else:
-        archive_identity = os.path.realpath(str(_root(archive_root)))
+        archive_identity = vault_publisher._source_lock_archive_identity(
+            archive_root
+        )
     lock_key = hashlib.sha256(
         (archive_identity + "\0" + str(scope)).encode("utf-8")
     ).hexdigest()
-    lock_directory = Path(tempfile.gettempdir()) / "readdaily-workbench-locks"
-    lock_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if lock_directory.is_symlink() or not lock_directory.is_dir():
-        raise PathSafetyError("工作台锁目录必须是真实目录")
-    lock_path = lock_directory / (lock_key + ".lock")
+    lock_directory = os.path.abspath(vault_publisher.WORKBENCH_LOCK_ROOT)
+    lock_path = os.path.join(lock_directory, lock_key + ".lock")
     with _RMW_THREAD_LOCKS_GUARD:
         thread_lock = _RMW_THREAD_LOCKS.setdefault(lock_key, threading.RLock())
     with thread_lock:
-        flags = os.O_CREAT | os.O_RDWR
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        descriptor = os.open(str(lock_path), flags, 0o600)
-        locked = False
-        try:
-            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                raise PathSafetyError("工作台锁必须是真实普通文件")
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
-            locked = True
-            yield lock_path
-        finally:
+        with vault_publisher._trusted_user_lock_directory(
+                lock_directory, "工作台锁目录") as (
+                    lock_directory_fd, pinned_lock_directory):
+            if pinned_lock_directory != lock_directory:
+                raise PathSafetyError("工作台锁目录身份不一致")
             try:
-                if locked:
-                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                descriptor = vault_publisher._open_lock_file_at(
+                    lock_directory_fd, os.path.basename(lock_path), 0o600,
+                )
+            except OSError as exc:
+                raise PathSafetyError("工作台锁无法安全打开") from exc
+            locked = False
+            try:
+                try:
+                    lock_info = os.fstat(descriptor)
+                    if (not stat.S_ISREG(lock_info.st_mode)
+                            or lock_info.st_uid != os.geteuid()
+                            or lock_info.st_mode
+                            & (stat.S_IWGRP | stat.S_IWOTH)):
+                        raise PathSafetyError(
+                            "工作台锁必须是当前用户持有的可信普通文件"
+                        )
+                    fcntl.flock(descriptor, fcntl.LOCK_EX)
+                except OSError as exc:
+                    raise PathSafetyError("工作台锁操作失败") from exc
+                locked = True
+                yield lock_path
             finally:
-                os.close(descriptor)
+                try:
+                    if locked:
+                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                finally:
+                    os.close(descriptor)
 
 
 def _load_json(path, default=None):
@@ -670,6 +709,49 @@ def _load_draft(archive_root, source, day):
     return _load_json(_draft_path(archive_root, source, day), {}) or {}
 
 
+def _sha256_matches(left, right):
+    return bool(
+        isinstance(left, str)
+        and isinstance(right, str)
+        and re.fullmatch(r"[a-f0-9]{64}", left)
+        and re.fullmatch(r"[a-f0-9]{64}", right)
+        and hmac.compare_digest(left, right)
+    )
+
+
+def _upgrade_matching_draft_revision(
+        archive_root, source, day, archive_evidence_sha256,
+        evidence_revision):
+    """Persist a cheap revision hint after one successful strong fallback.
+
+    The caller already holds the source evidence lock.  Taking the draft lock
+    second preserves the global evidence -> draft order.  The draft is reread
+    under that lock so a concurrent edit is never overwritten; only the
+    revision hint changes, leaving review content and ``saved_at`` untouched.
+    """
+    archive_session = vault_publisher._active_archive_session()
+    if archive_session is None:
+        raise PathSafetyError("草稿修订升级缺少已固定的归档目录会话")
+    with vault_publisher._draft_rmw_lock(archive_root, source, day):
+        current = _load_draft(archive_root, source, day)
+        if not current or not _sha256_matches(
+                current.get("evidence_sha256"), archive_evidence_sha256):
+            return current
+        if _sha256_matches(
+                current.get("evidence_revision"), evidence_revision):
+            return current
+        upgraded = dict(current)
+        upgraded["evidence_revision"] = evidence_revision
+        path = _draft_path(archive_root, source, day)
+        try:
+            _atomic_json(
+                _ArchiveJSONTarget(archive_session, path), upgraded
+            )
+        except OSError as exc:
+            raise PersistenceError("草稿修订升级失败：%s" % exc) from exc
+        return upgraded
+
+
 def _summary_sidecar(archive_root, source, day):
     path = _safe_internal(archive_root, "_summaries", _validate_source(source),
                           _validate_day(day) + ".json")
@@ -838,7 +920,8 @@ def _get_issue_overview(
     """
     source = _validate_source(source)
     day = _validate_day(day)
-    with vault_publisher._fetch_date_evidence_lock(archive_root, day):
+    with _source_evidence_read_lock(
+            archive_root, source, day, blocking=False):
         issue_dir = _issue_dir(archive_root, source, day)
         issue_path = issue_dir / "issue.json"
         issue = _load_json(issue_path)
@@ -880,19 +963,60 @@ def _get_issue_overview(
             warnings.append("期次没有正文单元")
 
         draft = _load_draft(archive_root, source, day)
+        evidence_revision = None
+        revision_matches = False
+        if draft:
+            evidence_revision = (
+                vault_publisher._issue_tree_revision_sha256(
+                    archive_root, source, day, issue=issue
+                )
+            )
+            if not evidence_revision:
+                raise ValidationError("本期报纸证据目录无法生成修订标识")
+            draft_revision = draft.get("evidence_revision")
+            revision_matches = _sha256_matches(
+                draft_revision, evidence_revision
+            )
+        draft_strong_evidence = (
+            draft.get("evidence_sha256") if draft else None
+        )
+        needs_strong_fallback = bool(
+            draft and not revision_matches
+            and isinstance(draft_strong_evidence, str)
+            and re.fullmatch(r"[a-f0-9]{64}", draft_strong_evidence)
+        )
         evidence_sha256 = None
-        if draft or require_publication_evidence:
+        if require_publication_evidence or needs_strong_fallback:
             evidence_sha256 = vault_publisher._issue_tree_evidence_sha256(
                 archive_root, source, day
             )
             if not evidence_sha256:
                 raise ValidationError("本期报纸证据目录无法完整校验")
-        draft_stale = bool(draft) and not (
-            isinstance(draft.get("evidence_sha256"), str)
-            and re.fullmatch(r"[a-f0-9]{64}", draft["evidence_sha256"])
-            and hmac.compare_digest(
-                draft["evidence_sha256"], evidence_sha256
+        strong_matches = bool(
+            draft and _sha256_matches(
+                draft_strong_evidence, evidence_sha256
             )
+        )
+        if draft and not revision_matches and strong_matches:
+            draft = _upgrade_matching_draft_revision(
+                archive_root, source, day, evidence_sha256,
+                evidence_revision,
+            )
+            draft_strong_evidence = draft.get("evidence_sha256") if draft else None
+            revision_matches = bool(
+                draft and _sha256_matches(
+                    draft.get("evidence_revision"), evidence_revision
+                )
+            )
+            strong_matches = bool(
+                draft and _sha256_matches(
+                    draft_strong_evidence, evidence_sha256
+                )
+            )
+        draft_stale = bool(draft) and not (
+            strong_matches
+            if require_publication_evidence
+            else revision_matches or strong_matches
         )
         if draft_stale:
             warnings.append("已有草稿基于旧版报纸证据，已隔离；请重新复核本期内容。")
@@ -991,6 +1115,7 @@ def _get_issue_overview(
             "draft_sha256": draft_sha256,
             "draft_stale": draft_stale,
             "evidence_sha256": evidence_sha256,
+            "evidence_revision": evidence_revision,
             "coverage": coverage,
             "text_length": text_length,
             "thumbnail": thumbnail,
@@ -999,15 +1124,24 @@ def _get_issue_overview(
         }
 
 
-def get_issue(archive_root, source, day):
+def get_issue(
+        archive_root, source, day, require_strong_evidence=False):
+    """Load one issue; normal navigation uses metadata-only revision checks."""
     source = _validate_source(source)
     day = _validate_day(day)
     with _archive_read_session(archive_root):
-        with vault_publisher._fetch_date_evidence_lock(archive_root, day):
-            return _get_issue_locked(archive_root, source, day)
+        with _source_evidence_read_lock(
+                archive_root, source, day,
+                blocking=require_strong_evidence):
+            return _get_issue_locked(
+                archive_root, source, day,
+                require_strong_evidence=require_strong_evidence,
+            )
 
 
-def _get_issue_locked(archive_root, source, day):
+def _get_issue_locked(
+        archive_root, source, day, require_strong_evidence=False,
+        _upgrade_draft_revision=True):
     source = _validate_source(source)
     day = _validate_day(day)
     issue_dir = _issue_dir(archive_root, source, day)
@@ -1048,15 +1182,67 @@ def _get_issue_locked(archive_root, source, day):
         warnings.append("期次没有版面清单")
     if not issue.get("units"):
         warnings.append("期次没有正文单元")
-    evidence_sha256 = vault_publisher._issue_tree_evidence_sha256(
-        archive_root, source, day
+    evidence_revision = vault_publisher._issue_tree_revision_sha256(
+        archive_root, source, day, issue=issue
     )
-    if not evidence_sha256:
-        raise ValidationError("本期报纸证据目录无法完整校验")
+    if not evidence_revision:
+        raise ValidationError("本期报纸证据目录无法生成修订标识")
     draft = _load_draft(archive_root, source, day)
+    draft_revision = draft.get("evidence_revision") if draft else None
+    revision_matches = bool(
+        draft and _sha256_matches(draft_revision, evidence_revision)
+    )
+    draft_strong_evidence = (
+        draft.get("evidence_sha256") if draft else None
+    )
+    needs_strong_fallback = bool(
+        draft
+        and not revision_matches
+        and isinstance(draft_strong_evidence, str)
+        and re.fullmatch(r"[a-f0-9]{64}", draft_strong_evidence)
+    )
+    archive_evidence_sha256 = None
+    if require_strong_evidence or needs_strong_fallback:
+        archive_evidence_sha256 = (
+            vault_publisher._issue_tree_evidence_sha256(
+                archive_root, source, day
+            )
+        )
+        if not archive_evidence_sha256:
+            raise ValidationError("本期报纸证据目录无法完整校验")
+    # Swift v0.3.1 expects this 64-hex field on every issue.  For ordinary
+    # navigation it carries the cheap revision token; save converts it to the
+    # strong content digest before persistence.  Publish requests strong mode.
+    evidence_sha256 = (
+        archive_evidence_sha256
+        if require_strong_evidence else evidence_revision
+    )
+    strong_matches = bool(
+        draft and _sha256_matches(
+            draft_strong_evidence, archive_evidence_sha256
+        )
+    )
+    if (draft and not revision_matches and strong_matches
+            and _upgrade_draft_revision):
+        draft = _upgrade_matching_draft_revision(
+            archive_root, source, day, archive_evidence_sha256,
+            evidence_revision,
+        )
+        draft_strong_evidence = draft.get("evidence_sha256") if draft else None
+        revision_matches = bool(
+            draft and _sha256_matches(
+                draft.get("evidence_revision"), evidence_revision
+            )
+        )
+        strong_matches = bool(
+            draft and _sha256_matches(
+                draft_strong_evidence, archive_evidence_sha256
+            )
+        )
     draft_stale = bool(draft) and not (
-        isinstance(draft.get("evidence_sha256"), str)
-        and hmac.compare_digest(draft["evidence_sha256"], evidence_sha256)
+        strong_matches
+        if require_strong_evidence
+        else revision_matches or strong_matches
     )
     if draft_stale:
         warnings.append("已有草稿基于旧版报纸证据，已隔离；请重新复核本期内容。")
@@ -1161,7 +1347,15 @@ def _get_issue_locked(archive_root, source, day):
         "issue_no": issue.get("issue_no"),
         "source_sha256": issue.get("source_sha256"),
         "evidence_sha256": evidence_sha256,
-        "archive_evidence_sha256": evidence_sha256,
+        "archive_evidence_sha256": (
+            archive_evidence_sha256 if require_strong_evidence else None
+        ),
+        "evidence_revision": evidence_revision,
+        "evidence_kind": (
+            "content_sha256"
+            if require_strong_evidence
+            else "metadata_revision_v1"
+        ),
         "draft_sha256": draft_sha256,
         "draft_stale": draft_stale,
         "channel": issue.get("channel"),
@@ -1224,7 +1418,10 @@ def validate_draft(
     issue = (
         _locked_issue
         if _locked_issue is not None
-        else get_issue(archive_root, source, day)
+        else get_issue(
+            archive_root, source, day,
+            require_strong_evidence=require_publish_ready,
+        )
     )
     if issue.get("source") != source or issue.get("date") != day:
         raise ValidationError("草稿与锁定的报纸期次身份不匹配")
@@ -1365,23 +1562,49 @@ def _save_draft_in_session(
 
     # Global lock order is evidence -> draft RMW.  Keeping the evidence lock
     # through validation, merge, issue ordering and the atomic write prevents a
-    # same-day fetch/import from replacing the issue between those operations.
-    with vault_publisher._fetch_date_evidence_lock(archive_root, day):
+    # same-source/day fetch/import from replacing the issue between operations.
+    with vault_publisher._fetch_source_evidence_lock(
+            archive_root, source, day):
         with vault_publisher._draft_rmw_lock(archive_root, source, day):
-            locked_issue = _get_issue_locked(archive_root, source, day)
+            locked_issue = _get_issue_locked(
+                archive_root, source, day,
+                _upgrade_draft_revision=False,
+            )
+            evidence_revision = locked_issue["evidence_revision"]
+            archive_evidence_sha256 = (
+                vault_publisher._issue_tree_evidence_sha256(
+                    archive_root, source, day
+                )
+            )
+            if not archive_evidence_sha256:
+                raise ValidationError("本期报纸证据目录无法完整校验")
+            strong_issue = dict(locked_issue)
+            strong_issue["evidence_sha256"] = archive_evidence_sha256
+            strong_issue["archive_evidence_sha256"] = (
+                archive_evidence_sha256
+            )
+            supplied_evidence = draft.get("evidence_sha256")
+            validation_issue = (
+                strong_issue
+                if isinstance(supplied_evidence, str)
+                and hmac.compare_digest(
+                    supplied_evidence, archive_evidence_sha256
+                )
+                else locked_issue
+            )
             incoming = validate_draft(
                 archive_root, draft, require_publish_ready=False,
-                _locked_issue=locked_issue,
+                _locked_issue=validation_issue,
             )
             previous = _load_draft(archive_root, source, day)
             previous_units = []
             if (previous and isinstance(previous.get("evidence_sha256"), str)
                     and hmac.compare_digest(
-                        previous["evidence_sha256"], incoming["evidence_sha256"]
+                        previous["evidence_sha256"], archive_evidence_sha256
                     )):
                 previous = validate_draft(
                     archive_root, previous, require_publish_ready=False,
-                    _locked_issue=locked_issue,
+                    _locked_issue=strong_issue,
                 )
                 previous_units = previous["units"]
             by_id = {str(unit["id"]): dict(unit) for unit in previous_units}
@@ -1401,7 +1624,8 @@ def _save_draft_in_session(
                 "schema_version": SCHEMA_VERSION,
                 "source": source,
                 "date": day,
-                "evidence_sha256": incoming["evidence_sha256"],
+                "evidence_sha256": archive_evidence_sha256,
+                "evidence_revision": evidence_revision,
                 "units": [
                     by_id[unit_id] for unit_id in issue_order
                     if unit_id in by_id
@@ -1419,6 +1643,7 @@ def _save_draft_in_session(
         "source": normalized["source"],
         "date": normalized["date"],
         "evidence_sha256": normalized["evidence_sha256"],
+        "evidence_revision": normalized["evidence_revision"],
         "unit_count": len(normalized["units"]),
         "draft_path": str(path),
     }
@@ -1501,9 +1726,26 @@ def _get_inbox_in_session(archive_root, day=None, source=None):
     rows = []
     for issue_path_string in sorted(glob.glob(pattern), reverse=True):
         issue_path = Path(issue_path_string)
-        source = issue_path.parent.parent.name
-        issue_day = issue_path.parent.name
-        if source.startswith("_"):
+        raw_source = issue_path.parent.parent.name
+        raw_day = issue_path.parent.name
+        if raw_source.startswith("_") or raw_day.startswith("."):
+            continue
+        try:
+            source = _validate_source(raw_source)
+            issue_day = _validate_day(raw_day)
+        except APIError as exc:
+            # Legacy/ad-hoc directories are isolated as one failed row.  They
+            # must not crash the fixed eight-paper inbox or bypass the shared
+            # lower-case source/date lock contract.
+            rows.append({
+                "source": raw_source,
+                "date": raw_day,
+                "status": "failed",
+                "review_status": "blocked",
+                "publish_status": "blocked",
+                "text_length": 0,
+                "warnings": [str(exc)],
+            })
             continue
         state = _load_state(archive, source, issue_day)
         stages = state.get("stages") or {}
@@ -1518,6 +1760,18 @@ def _get_inbox_in_session(archive_root, day=None, source=None):
                 issue_day,
                 require_publication_evidence=require_publication_evidence,
             )
+        except SourceUpdatingError as exc:
+            rows.append({
+                "source": source,
+                "date": issue_day,
+                "available": True,
+                "status": "running",
+                "review_status": "updating",
+                "publish_status": "not_ready",
+                "text_length": 0,
+                "warnings": [str(exc)],
+            })
+            continue
         except APIError as exc:
             rows.append({
                 "source": source, "date": issue_day, "status": "failed",
@@ -1570,6 +1824,7 @@ def _get_inbox_in_session(archive_root, day=None, source=None):
             "success_count": sum(1 for row in rows
                                  if row["status"] != "failed" and row.get("text_length", 0) > 0),
             "failed_count": sum(1 for row in rows if row["status"] == "failed"),
+            "updating_count": sum(1 for row in rows if row["status"] == "running"),
             "needs_review_count": sum(1 for row in rows if row["review_status"] == "pending"),
             "published_count": sum(1 for row in rows if row["publish_status"] == "published"),
         },
@@ -1755,6 +2010,7 @@ def _get_daily_dashboard_in_session(archive_root, day=None, source=None):
         issue_path = _issue_dir(archive_root, source_id, day) / "issue.json"
         issue = None
         load_error = None
+        source_updating = None
         if issue_path.is_file():
             try:
                 issue = _get_issue_overview(
@@ -1766,9 +2022,11 @@ def _get_daily_dashboard_in_session(archive_root, day=None, source=None):
                         and (stages.get("published") or stages.get("archived"))
                     ),
                 )
+            except SourceUpdatingError as exc:
+                source_updating = str(exc)
             except APIError as exc:
                 load_error = str(exc)
-        available = issue is not None
+        available = issue is not None or source_updating is not None
         read_record = _activity_record(activity, source_id)
         coverage = issue["coverage"] if issue else {
             "editions": 0,
@@ -1791,7 +2049,14 @@ def _get_daily_dashboard_in_session(archive_root, day=None, source=None):
             issue and _publication_matches_overview(state, issue)
         )
 
-        if active_failure or load_error:
+        if source_updating:
+            status = "running"
+            acquisition_status = "running"
+            review_status = "updating"
+            publish_status = (
+                "not_ready" if configured["can_publish"] else "not_supported"
+            )
+        elif active_failure or load_error:
             status = "failed"
             acquisition_status = "failed"
             review_status = "blocked"
@@ -1854,6 +2119,7 @@ def _get_daily_dashboard_in_session(archive_root, day=None, source=None):
             "warnings": list(dict.fromkeys(
                 ((issue.get("warnings") or []) if issue else [])
                 + (list(state.get("warnings") or []))
+                + ([source_updating] if source_updating else [])
                 + ([load_error] if load_error else [])
                 + (["既有发布记录对应旧版报纸证据，需重新复核发布"]
                    if issue and (
@@ -1895,6 +2161,7 @@ def _get_daily_dashboard_in_session(archive_root, day=None, source=None):
             "available_count": sum(1 for row in rows if row["available"]),
             "missing_count": sum(1 for row in rows if not row["available"]),
             "failed_count": sum(1 for row in rows if row["status"] == "failed"),
+            "updating_count": sum(1 for row in rows if row["status"] == "running"),
             "reading_complete_count": sum(
                 1 for row in rows if row["reading_status"] == "completed"
             ),
@@ -2018,7 +2285,9 @@ def _dispatch(args):
         _assert_archive_isolated(args.archive, args.vault)
         source = _require(args.source, "--source")
         day = _require(args.date, "--date")
-        issue = get_issue(args.archive, source, day)
+        issue = get_issue(
+            args.archive, source, day, require_strong_evidence=True
+        )
         if issue.get("local_pdf_date_verification") == "unverified":
             raise ValidationError("本地 PDF 的第一页报头日期尚未唯一核验，禁止发布")
         draft = _load_draft(args.archive, source, day)

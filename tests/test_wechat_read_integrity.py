@@ -2,6 +2,7 @@ import datetime
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -715,6 +716,28 @@ class WechatReadIntegrityTests(unittest.TestCase):
         self.assertIn("第1版 OCR 失败", error)
         for path, expected in snapshots.items():
             self.assertEqual(path.read_bytes(), expected)
+
+    def test_ocr_memory_error_is_not_masked_by_temp_cleanup_failure(self):
+        self.write_parse_issue()
+        primary = MemoryError("OCR out of memory")
+        cleanup = OSError("temporary unlink failed")
+        real_unlink = wechat_read.os.unlink
+
+        def fail_only_ocr_temporary(path, *args, **kwargs):
+            if "readdaily-wechat-ocr-" in os.fspath(path):
+                raise cleanup
+            return real_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(
+                wechat_read, "ocr_image", side_effect=primary
+        ), mock.patch.object(
+                wechat_read.os, "unlink", side_effect=fail_only_ocr_temporary
+        ):
+            with self.assertRaises(MemoryError) as caught:
+                wechat_read.parse(self.source, self.day, self.archive)
+
+        self.assertIs(caught.exception, primary)
+        self.assertIs(caught.exception.__cause__, cleanup)
 
     def test_directory_swap_restores_previous_issue_when_new_tree_commit_fails(self):
         target = self.base / "swap-target"

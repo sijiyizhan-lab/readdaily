@@ -56,7 +56,10 @@ struct ReadingDeskRootView: View {
                 }
             }
             .onDrop(of: [UTType.pdf.identifier], isTargeted: $isDropTarget, perform: handleDrop)
-            .onReceive(NotificationCenter.default.publisher(for: .readingDeskImportPDF)) { _ in isImporting = true }
+            .onReceive(NotificationCenter.default.publisher(for: .readingDeskImportPDF)) { _ in
+                guard !viewModel.isEditorialBusy else { return }
+                isImporting = true
+            }
             .task { viewModel.refresh() }
             .alert(item: $viewModel.presentedError) { error in
                 Alert(
@@ -79,7 +82,7 @@ struct ReadingDeskRootView: View {
             .sheet(item: $viewModel.publishPlan) { plan in
                 PublishPreviewSheet(
                     plan: plan,
-                    isBusy: viewModel.isBusy,
+                    isBusy: viewModel.isEditorialBusy,
                     onCancel: { viewModel.publishPlan = nil },
                     onConfirm: { viewModel.confirmPublish(planID: plan.id) }
                 )
@@ -92,7 +95,7 @@ struct ReadingDeskRootView: View {
             .sheet(isPresented: $showHistory) {
                 HistorySheet(
                     transactions: viewModel.history,
-                    isBusy: viewModel.isBusy,
+                    isBusy: viewModel.isEditorialBusy,
                     onRefresh: { viewModel.loadHistory() },
                     onRollback: { viewModel.rollback(transactionID: $0) },
                     onClose: { showHistory = false }
@@ -105,21 +108,21 @@ struct ReadingDeskRootView: View {
     @ToolbarContentBuilder
     private var toolbar: some ToolbarContent {
         ToolbarItemGroup(placement: .primaryAction) {
-            if viewModel.isBusy || viewModel.isIssueLoading {
-                let title = viewModel.isBusy ? viewModel.operationTitle : viewModel.issueLoadTitle
+            if viewModel.isEditorialBusy || viewModel.isIssueLoading {
+                let title = viewModel.activeOperationTitle
                 ProgressView().controlSize(.small).help(title)
                     .accessibilityLabel(title)
             }
             Button { viewModel.refresh() } label: { Label("刷新", systemImage: "arrow.clockwise") }
                 .labelStyle(.iconOnly)
-                .disabled(viewModel.isBusy)
+                .disabled(viewModel.isEditorialBusy)
                 .keyboardShortcut("r", modifiers: .command)
                 .help("刷新读报台")
 
             Button { viewModel.fetchDailyPapers() } label: {
                 Label("抓取当日8报", systemImage: "arrow.down.doc.fill")
             }
-            .disabled(viewModel.isBusy || viewModel.selectedDate == nil)
+            .disabled(viewModel.isEditorialBusy || viewModel.selectedDate == nil)
             .help("按所选日期抓取八家报纸；首次打开默认今天")
 
             Menu {
@@ -132,7 +135,7 @@ struct ReadingDeskRootView: View {
             } label: {
                 Label("更多", systemImage: "ellipsis.circle")
             }
-            .disabled(viewModel.isBusy)
+            .disabled(viewModel.isEditorialBusy)
 
             Divider()
 
@@ -140,7 +143,7 @@ struct ReadingDeskRootView: View {
                 Label("保存草稿", systemImage: viewModel.hasUnsavedChanges ? "square.and.arrow.down.fill" : "square.and.arrow.down")
             }
             .labelStyle(.iconOnly)
-            .disabled(viewModel.isBusy || viewModel.issueDetail == nil || !viewModel.hasUnsavedChanges)
+            .disabled(viewModel.isEditorialBusy || viewModel.issueDetail == nil || !viewModel.hasUnsavedChanges)
             .keyboardShortcut("s", modifiers: .command)
             .help("保存草稿，不写入 Obsidian")
 
@@ -149,12 +152,13 @@ struct ReadingDeskRootView: View {
             }
             .buttonStyle(.borderedProminent)
             .tint(ReadingDeskTheme.accent)
-            .disabled(viewModel.isBusy || !viewModel.canPublishSelectedIssue)
+            .disabled(viewModel.isEditorialBusy || !viewModel.canPublishSelectedIssue)
             .help(viewModel.canPublishSelectedIssue ? "预览后确认发布" : "目前仅中国建设报支持发布")
         }
     }
 
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
+        guard !viewModel.isEditorialBusy else { return false }
         guard let provider = providers.first(where: { $0.hasItemConformingToTypeIdentifier(UTType.pdf.identifier) }) else {
             return false
         }
@@ -230,7 +234,7 @@ private struct DailyInboxSidebar: View {
                                     }
                                 }
                             }
-                        } else if !viewModel.isBusy {
+                        } else if !viewModel.isEditorialBusy {
                             EmptyRow(title: "暂无报纸", detail: "刷新或抓取当日8报", symbol: "tray")
                                 .readingDeskCard(padding: 12, cool: true)
                         }
@@ -238,10 +242,10 @@ private struct DailyInboxSidebar: View {
                     .padding(.bottom, 8)
                 }
 
-                if viewModel.isBusy || viewModel.isIssueLoading {
+                if viewModel.isEditorialBusy || viewModel.isIssueLoading {
                     HStack(spacing: 9) {
                         ProgressView().controlSize(.small)
-                        Text(viewModel.isBusy ? viewModel.operationTitle : viewModel.issueLoadTitle)
+                        Text(viewModel.activeOperationTitle)
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -265,7 +269,7 @@ private struct DailyInboxSidebar: View {
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
-            .disabled(viewModel.isBusy || viewModel.availableDates.isEmpty)
+            .disabled(viewModel.isEditorialBusy || viewModel.availableDates.isEmpty)
             .accessibilityLabel("选择读报日期")
             .accessibilityValue(viewModel.selectedDate ?? "暂无日期")
         }
@@ -382,7 +386,7 @@ private struct EditionColumn: View {
                                     )
                                 }
                                 .buttonStyle(.plain)
-                                .disabled(viewModel.isBusy)
+                                .disabled(!viewModel.canNavigateEditions)
                             }
                         }
                     }

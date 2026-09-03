@@ -96,8 +96,6 @@ public struct ReadDailyCommandFactory: Sendable {
     }
 
     public func make(_ command: ReadDailyAPICommand) throws -> ProcessRequest {
-        let commandLineScript = configuration.repositoryURL
-            .appendingPathComponent("scripts/readdaily.py").path
         let environment = [
             "READDAILY_ARCHIVE": configuration.archiveURL.path,
             "READDAILY_VAULT": configuration.vaultURL.path,
@@ -107,7 +105,8 @@ public struct ReadDailyCommandFactory: Sendable {
         ]
 
         if case .fetchConstruction(let date) = command {
-            var arguments = [commandLineScript, "fetch", "--source", "zgjsb"]
+            var arguments = fetchArguments
+            arguments += ["--source", "zgjsb"]
             append("--date", date, to: &arguments)
             return ProcessRequest(
                 executableURL: configuration.pythonExecutableURL,
@@ -116,7 +115,7 @@ public struct ReadDailyCommandFactory: Sendable {
             )
         }
         if case .fetchDaily(let date) = command {
-            var arguments = [commandLineScript, "fetch"]
+            var arguments = fetchArguments
             append("--date", date, to: &arguments)
             return ProcessRequest(
                 executableURL: configuration.pythonExecutableURL,
@@ -167,6 +166,14 @@ public struct ReadDailyCommandFactory: Sendable {
             arguments: arguments,
             environment: environment
         )
+    }
+
+    private var fetchArguments: [String] {
+        let fetchScript = configuration.repositoryURL
+            .appendingPathComponent("skills/newspaper-fetch/scripts/fetch.py").path
+        let registry = configuration.repositoryURL
+            .appendingPathComponent("skills/newspaper-fetch/sources.json").path
+        return [fetchScript, "--registry", registry]
     }
 
     private func append(_ flag: String, _ value: String?, to arguments: inout [String]) {

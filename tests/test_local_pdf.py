@@ -20,17 +20,17 @@ PDF_BYTES = b"%PDF-1.4\n% local fixture\n"
 def _shared_evidence_lock_worker(kind, archive, day, ready, entered, rejected):
     if kind == "fetch":
         import fetch
-        lock = fetch.fetch_date_lock
-        expected_rejection = fetch.FetchLockedError
+        lock = fetch.fetch_source_evidence_lock
+        expected_rejection = None
     else:
         reader_scripts = ROOT / "skills" / "newspaper-reader" / "scripts"
         sys.path.insert(0, str(reader_scripts))
         import vault_publisher
-        lock = vault_publisher._fetch_date_evidence_lock
+        lock = vault_publisher._fetch_source_evidence_lock
         expected_rejection = None
     ready.set()
     try:
-        with lock(archive, day):
+        with lock(archive, "zgjsb", day):
             entered.set()
     except Exception as exc:
         if expected_rejection is None or not isinstance(exc, expected_rejection):
@@ -176,7 +176,7 @@ class LocalPDFImportTests(unittest.TestCase):
                 side_effect=fail_after_final_replace,
             ):
                 with self.assertRaisesRegex(
-                    OSError, "content parent fsync failed"
+                    local_pdf.lib.ArchiveTransactionError, "耐久提交"
                 ):
                     local_pdf._copy_content_addressed(
                         source, archive, digest
@@ -191,6 +191,7 @@ class LocalPDFImportTests(unittest.TestCase):
         for kind in ("fetch", "publisher"):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as td:
                 archive = pathlib.Path(td) / "archive"
+                archive.mkdir()
                 ready = context.Event()
                 entered = context.Event()
                 rejected = context.Event()
@@ -204,15 +205,11 @@ class LocalPDFImportTests(unittest.TestCase):
                 with local_pdf._issue_date_lock(archive, "2026-09-01"):
                     process.start()
                     self.assertTrue(ready.wait(timeout=5), "锁竞争进程未启动")
-                    if kind == "fetch":
-                        self.assertTrue(rejected.wait(timeout=5))
-                    else:
-                        self.assertFalse(
-                            entered.wait(timeout=0.3),
-                            "本地导入锁持有期间共享证据锁不应被取得",
-                        )
-                if kind == "publisher":
-                    self.assertTrue(entered.wait(timeout=5))
+                    self.assertFalse(
+                        entered.wait(timeout=0.3),
+                        "本地导入锁持有期间共享证据锁不应被取得",
+                    )
+                self.assertTrue(entered.wait(timeout=5))
                 process.join(timeout=5)
                 self.assertFalse(process.is_alive(), "锁竞争进程超时")
                 self.assertEqual(process.exitcode, 0)

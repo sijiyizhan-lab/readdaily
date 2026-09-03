@@ -87,6 +87,36 @@ struct PageImageLoadCoordinatorTests {
         #expect(loader.value == nil)
         #expect(loader.isLoading == false)
     }
+
+    @Test("迟到的旧请求低清占位不会覆盖新页面")
+    @MainActor
+    func delayedOldPlaceholderCannotReplaceNewImage() async {
+        let delayedPlaceholder = SuspendedValue<String>()
+        let loader = PageImageLoadCoordinator<String>()
+
+        let requestA = Task { @MainActor in
+            await loader.load(
+                requestID: "A",
+                placeholder: { await delayedPlaceholder.wait() },
+                operation: { "A high resolution" }
+            )
+        }
+        while !(await delayedPlaceholder.isWaiting) {
+            await Task.yield()
+        }
+
+        await loader.load(requestID: "B") {
+            "B high resolution"
+        }
+        #expect(loader.value == "B high resolution")
+        #expect(!loader.isLoading)
+
+        await delayedPlaceholder.resume(returning: "A thumbnail")
+        await requestA.value
+
+        #expect(loader.value == "B high resolution")
+        #expect(!loader.isLoading)
+    }
 }
 
 private actor SuspendedValue<Value> {

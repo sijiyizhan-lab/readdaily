@@ -50,7 +50,9 @@ final class ReadingDeskViewModel: ObservableObject {
     @Published var editorState: DraftEditorState?
     @Published private(set) var dirtyUnitIDs: Set<String> = []
     @Published private(set) var isBusy = false
+    @Published private(set) var isFetchingDaily = false
     @Published private(set) var operationTitle = ""
+    @Published private(set) var fetchOperationTitle = ""
     @Published private(set) var isIssueLoading = false
     @Published private(set) var issueLoadTitle = ""
     @Published var presentedError: PresentedError?
@@ -73,6 +75,7 @@ final class ReadingDeskViewModel: ObservableObject {
     private let clientFactory: (ReadDailyConfiguration) -> ReadDailyClient
     private let issuePayloadMappingExecutor: IssuePayloadMappingExecutor
     private var issueLoadTask: Task<Void, Never>?
+    private var fetchTask: Task<Void, Never>?
     private var issueLoadGeneration = 0
     private var readingMarkTasks: [IssueCacheKey: Task<Void, Never>] = [:]
     private var readingMarkTaskIDs: [IssueCacheKey: UUID] = [:]
@@ -149,6 +152,16 @@ final class ReadingDeskViewModel: ObservableObject {
 
     var canPublishSelectedIssue: Bool { issueDetail?.sourceID == constructionSourceID }
 
+    var canNavigateEditions: Bool { !isBusy }
+
+    var isEditorialBusy: Bool { isBusy || isFetchingDaily }
+
+    var activeOperationTitle: String {
+        if isBusy { return operationTitle }
+        if isIssueLoading { return issueLoadTitle }
+        return fetchOperationTitle
+    }
+
     var hasUnsavedChanges: Bool { !dirtyUnitIDs.isEmpty || editorState?.hasUnsavedChanges == true }
 
     var allWarnings: [String] {
@@ -156,7 +169,7 @@ final class ReadingDeskViewModel: ObservableObject {
     }
 
     func refresh() {
-        guard !isBusy else { return }
+        guard !isEditorialBusy else { return }
         guard navigationGate.request(.refresh, hasUnsavedChanges: hasUnsavedChanges) else {
             showingDiscardChangesConfirmation = true
             return
@@ -168,7 +181,7 @@ final class ReadingDeskViewModel: ObservableObject {
     func applySettings(_ values: ReadDailySettingsValues) -> Bool {
         let current = settings.values
         guard values != current else { return true }
-        guard !isBusy else {
+        guard !isEditorialBusy else {
             show(ReadDailyClientError.backendRejected(
                 message: "当前操作尚未完成，不能切换数据目录。",
                 recovery: "等待当前操作完成后，再应用设置。"
@@ -204,7 +217,7 @@ final class ReadingDeskViewModel: ObservableObject {
     }
 
     private func refreshNow() {
-        guard !isBusy else { return }
+        guard !isEditorialBusy else { return }
         invalidateIssueCache()
         invalidateLoadedIssue()
         run(title: "正在刷新收件箱", retry: .refresh) { [weak self] in
@@ -215,7 +228,7 @@ final class ReadingDeskViewModel: ObservableObject {
     }
 
     func selectDate(_ date: String) {
-        guard !isBusy else { return }
+        guard !isEditorialBusy else { return }
         guard date != selectedDate else { return }
         guard navigationGate.request(.selectDate(date), hasUnsavedChanges: hasUnsavedChanges) else {
             showingDiscardChangesConfirmation = true
@@ -225,7 +238,7 @@ final class ReadingDeskViewModel: ObservableObject {
     }
 
     private func selectDateNow(_ date: String) {
-        guard !isBusy else { return }
+        guard !isEditorialBusy else { return }
         selectedDate = date
         invalidateLoadedIssue(clearSelection: true)
         run(title: "正在读取 \(date) 的读报台", retry: .refresh) { [weak self] in
@@ -274,84 +287,101 @@ final class ReadingDeskViewModel: ObservableObject {
     }
 
     func selectEdition(_ id: String?) {
-        guard !isBusy else { return }
+        guard canNavigateEditions else { return }
         guard id != selectedEditionID else { return }
         commitCurrentEditor()
         selectedEditionID = id
         loadEditorForSelection()
     }
 
-    func updateTitle(_ value: String) { mutateDraft { $0.title = value } }
-    func updateSummary(_ value: String) { mutateDraft { $0.summary = value } }
-    func updateProofreadText(_ value: String) {
-        mutateDraft { draft in
+    func updateTitle(_ value: String, expectedEditionID: String? = nil) {
+        mutateDraft(expectedEditionID: expectedEditionID) { $0.title = value }
+    }
+
+    func updateSummary(_ value: String, expectedEditionID: String? = nil) {
+        mutateDraft(expectedEditionID: expectedEditionID) { $0.summary = value }
+    }
+
+    func updateProofreadText(_ value: String, expectedEditionID: String? = nil) {
+        mutateDraft(expectedEditionID: expectedEditionID) { draft in
             draft.proofreadText = value
             draft.ocrReviewStatus = value == draft.ocrText ? .unreviewed : .edited
         }
     }
 
-    func setOCRReviewStatus(_ status: OCRReviewStatus) {
-        mutateDraft { $0.ocrReviewStatus = status }
+    func setOCRReviewStatus(_ status: OCRReviewStatus, expectedEditionID: String? = nil) {
+        mutateDraft(expectedEditionID: expectedEditionID) { $0.ocrReviewStatus = status }
     }
 
-    func restoreOriginalOCR() {
-        mutateDraft { draft in
+    func restoreOriginalOCR(expectedEditionID: String? = nil) {
+        mutateDraft(expectedEditionID: expectedEditionID) { draft in
             draft.proofreadText = draft.ocrText
             draft.ocrReviewStatus = .unreviewed
         }
     }
 
-    func addOCRSuspicion() {
-        mutateDraft { $0.ocrSuspicions.append("") }
+    func addOCRSuspicion(expectedEditionID: String? = nil) {
+        mutateDraft(expectedEditionID: expectedEditionID) { $0.ocrSuspicions.append("") }
     }
 
-    func updateOCRSuspicion(at index: Int, value: String) {
-        mutateDraft { draft in
+    func updateOCRSuspicion(at index: Int, value: String, expectedEditionID: String? = nil) {
+        mutateDraft(expectedEditionID: expectedEditionID) { draft in
             guard draft.ocrSuspicions.indices.contains(index) else { return }
             draft.ocrSuspicions[index] = value
         }
     }
 
-    func removeOCRSuspicion(at index: Int) {
-        mutateDraft { draft in
+    func removeOCRSuspicion(at index: Int, expectedEditionID: String? = nil) {
+        mutateDraft(expectedEditionID: expectedEditionID) { draft in
             guard draft.ocrSuspicions.indices.contains(index) else { return }
             draft.ocrSuspicions.remove(at: index)
         }
     }
-    func setImportance(_ value: Int) {
+
+    func setImportance(_ value: Int, expectedEditionID: String? = nil) {
+        // Reading and editing stay available during a background fetch. Its
+        // edit revision prevents the completion refresh from reloading over it.
+        guard !isBusy else { return }
         guard var editor = editorState else { return }
+        guard expectedEditionID == nil
+                || (selectedEditionID == expectedEditionID && editor.draft.id == expectedEditionID) else { return }
         editor.setImportance(value)
         editorState = editor
         markCurrentDirty()
     }
 
-    func toggleTopic(_ topic: ReadingTopic) {
-        mutateDraft { draft in
+    func toggleTopic(_ topic: ReadingTopic, expectedEditionID: String? = nil) {
+        mutateDraft(expectedEditionID: expectedEditionID) { draft in
             if draft.topics.contains(topic) { draft.topics.remove(topic) }
             else { draft.topics.insert(topic) }
         }
     }
 
-    func updateFact(at index: Int, _ keyPath: WritableKeyPath<FactFields, String>, value: String) {
-        mutateDraft { draft in
+    func updateFact(
+        at index: Int,
+        _ keyPath: WritableKeyPath<FactFields, String>,
+        value: String,
+        expectedEditionID: String? = nil
+    ) {
+        mutateDraft(expectedEditionID: expectedEditionID) { draft in
             guard draft.facts.indices.contains(index) else { return }
             draft.facts[index][keyPath: keyPath] = value
         }
     }
 
-    func addFact() {
-        mutateDraft { $0.facts.append(FactFields()) }
+    func addFact(expectedEditionID: String? = nil) {
+        mutateDraft(expectedEditionID: expectedEditionID) { $0.facts.append(FactFields()) }
     }
 
-    func removeFact(at index: Int) {
-        mutateDraft { draft in
+    func removeFact(at index: Int, expectedEditionID: String? = nil) {
+        mutateDraft(expectedEditionID: expectedEditionID) { draft in
             guard draft.facts.indices.contains(index) else { return }
             draft.facts.remove(at: index)
         }
     }
 
     func fetchDailyPapers() {
-        guard !isBusy else { return }
+        guard !isEditorialBusy else { return }
         guard let date = selectedDate ?? dashboardDay?.date ?? availableDates.first else {
             show(ReadDailyClientError.backendRejected(
                 message: "尚未选择读报日期。",
@@ -367,30 +397,70 @@ final class ReadingDeskViewModel: ObservableObject {
     }
 
     private func fetchDailyPapersNow(date: String) {
-        guard !isBusy else { return }
-        invalidateIssueCache()
+        guard !isEditorialBusy else { return }
         selectedDate = date
-        invalidateLoadedIssue(clearSelection: true)
-        run(title: "正在抓取 \(date) 当日8报", retry: .fetchDaily(date)) { [weak self] in
+        let revisionAtStart = editRevision
+        isFetchingDaily = true
+        fetchOperationTitle = "正在抓取 \(date) 当日8报"
+        presentedError = nil
+        retryAction = nil
+        fetchTask = Task { [weak self] in
             guard let self else { return }
-            let client = self.makeClient()
-            self.lastLog = try await client.fetchDaily(date: date)
-            try await self.refreshInboxNow(client: client, loadSelection: true)
-            let entries = self.dashboardDay?.entries ?? []
-            let available = entries.filter { $0.issue != nil }.count
-            let failed = entries.filter { $0.status == .failed }.count
-            if available == NewspaperRegistry.dailySources.count, failed == 0 {
-                self.notice = "当日8报均已获取，读报台已刷新。"
-            } else {
-                self.notice = "抓取结束：已获取 \(available)/8 份"
-                    + (failed > 0 ? "，\(failed) 份失败" : "")
-                    + "；缺报可稍后重试。"
+            defer {
+                self.isFetchingDaily = false
+                self.fetchOperationTitle = ""
+                self.fetchTask = nil
+            }
+            do {
+                let client = self.makeClient()
+                self.lastLog = try await client.fetchDaily(date: date)
+                self.invalidateIssueCache()
+                try await self.refreshInboxNow(client: client, loadSelection: false)
+
+                // Navigation is intentionally available while acquisition runs.
+                // Reload only the still-selected paper and never replace edits
+                // that arrived after the fetch began (for example a delayed IME
+                // binding update).
+                let keptLateEdits = self.hasUnsavedChanges
+                    && self.editRevision != revisionAtStart
+                if !keptLateEdits,
+                   let selected = self.selectedIssue,
+                   selected.date == date {
+                    self.startIssueLoad(
+                        source: selected.sourceID,
+                        date: selected.date,
+                        client: client,
+                        recordOpened: false
+                    )
+                }
+
+                let entries = self.dashboardDay?.entries ?? []
+                let available = entries.filter { $0.issue != nil }.count
+                let failed = entries.filter { $0.status == .failed }.count
+                if keptLateEdits {
+                    self.notice = "抓取完成；当前未保存编辑已保留，请保存后再刷新本报。"
+                } else if available == NewspaperRegistry.dailySources.count, failed == 0 {
+                    self.notice = "当日8报均已获取，读报台已刷新。"
+                } else {
+                    self.notice = "抓取结束：已获取 \(available)/8 份"
+                        + (failed > 0 ? "，\(failed) 份失败" : "")
+                        + "；缺报可稍后重试。"
+                }
+            } catch {
+                self.show(error, retry: .fetchDaily(date))
             }
         }
     }
 
     func importPDF(_ url: URL, removeAfterImport: Bool = false) {
-        guard !isBusy else { return }
+        guard !isEditorialBusy else {
+            if removeAfterImport { try? FileManager.default.removeItem(at: url) }
+            show(ReadDailyClientError.backendRejected(
+                message: "当前操作尚未完成，不能导入 PDF。",
+                recovery: "等待当前抓取、保存或发布完成后，再重新选择 PDF。"
+            ))
+            return
+        }
         let action = NavigationAction.importPDF(url, removeAfterImport)
         guard navigationGate.request(action, hasUnsavedChanges: hasUnsavedChanges) else {
             showingDiscardChangesConfirmation = true
@@ -400,7 +470,10 @@ final class ReadingDeskViewModel: ObservableObject {
     }
 
     private func importPDFNow(_ url: URL, removeAfterImport: Bool) {
-        guard !isBusy else { return }
+        guard !isEditorialBusy else {
+            if removeAfterImport { try? FileManager.default.removeItem(at: url) }
+            return
+        }
         invalidateIssueCache()
         invalidateLoadedIssue(clearSelection: true)
         run(title: "正在导入并解析 PDF", retry: .importPDF(url, removeAfterImport)) { [weak self] in
@@ -539,7 +612,7 @@ final class ReadingDeskViewModel: ObservableObject {
     }
 
     func markSelectedIssue(_ status: ReadingCompletionStatus) {
-        guard !isBusy else { return }
+        guard !isEditorialBusy else { return }
         guard let issue = selectedIssue else { return }
         let key = IssueCacheKey(source: issue.sourceID, date: issue.date)
         cancelAutomaticReadingMark(for: key)
@@ -827,15 +900,23 @@ final class ReadingDeskViewModel: ObservableObject {
         client: ReadDailyClient,
         recordOpened: Bool = false
     ) {
-        invalidateLoadedIssue()
         let key = IssueCacheKey(source: source, date: date)
+        let preferredEditionID = (
+            issueDetail?.sourceID == key.source && issueDetail?.date == key.date
+        ) ? selectedEditionID : nil
+        invalidateLoadedIssue()
         let readingStatusAtOpen = readingStatus(for: key)
         let readingRevisionAtOpen = readingRevision(for: key)
         retryAction = .loadIssue(source, date)
         presentedError = nil
 
         if let cached = cachedIssue(for: key) {
-            applyLoadedIssue(cached, warnings: [], key: key)
+            applyLoadedIssue(
+                cached,
+                warnings: [],
+                key: key,
+                preferredEditionID: preferredEditionID
+            )
             if recordOpened {
                 recordOpenedInBackgroundIfNeeded(
                     key: key,
@@ -867,7 +948,12 @@ final class ReadingDeskViewModel: ObservableObject {
                 }
 
                 self.storeIssueInCache(loadedIssue, for: key)
-                self.applyLoadedIssue(loadedIssue, warnings: envelope.warnings, key: key)
+                self.applyLoadedIssue(
+                    loadedIssue,
+                    warnings: envelope.warnings,
+                    key: key,
+                    preferredEditionID: preferredEditionID
+                )
                 self.finishIssueLoad(generation: generation)
                 if recordOpened {
                     self.recordOpenedInBackgroundIfNeeded(
@@ -890,12 +976,15 @@ final class ReadingDeskViewModel: ObservableObject {
     private func applyLoadedIssue(
         _ loadedIssue: IssueDetail,
         warnings: [String],
-        key: IssueCacheKey
+        key: IssueCacheKey,
+        preferredEditionID: String? = nil
     ) {
         guard selectedIssue?.sourceID == key.source,
               selectedIssue?.date == key.date else { return }
         issueDetail = loadedIssue
-        selectedEditionID = loadedIssue.editions.first?.id
+        selectedEditionID = preferredEditionID.flatMap { previous in
+            loadedIssue.editions.contains { $0.id == previous } ? previous : nil
+        } ?? loadedIssue.editions.first?.id
         dirtyUnitIDs.removeAll()
         loadEditorForSelection()
         lastLog = warnings.joined(separator: "\n")
@@ -1138,8 +1227,17 @@ final class ReadingDeskViewModel: ObservableObject {
         lastLog = envelope.warnings.joined(separator: "\n")
     }
 
-    private func mutateDraft(_ mutation: (inout ArticleDraft) -> Void) {
+    private func mutateDraft(
+        expectedEditionID: String? = nil,
+        _ mutation: (inout ArticleDraft) -> Void
+    ) {
+        // Keep editing available during a background fetch, including setters
+        // already queued by TextField/IME. The completion refresh compares
+        // editRevision and preserves these user edits.
+        guard !isBusy else { return }
         guard var editor = editorState else { return }
+        guard expectedEditionID == nil
+                || (selectedEditionID == expectedEditionID && editor.draft.id == expectedEditionID) else { return }
         mutation(&editor.draft)
         editorState = editor
         markCurrentDirty()
@@ -1241,7 +1339,7 @@ final class ReadingDeskViewModel: ObservableObject {
         retry: RetryAction,
         operation: @escaping @MainActor () async throws -> Void
     ) {
-        guard !isBusy else { return }
+        guard !isEditorialBusy else { return }
         isBusy = true
         operationTitle = title
         presentedError = nil

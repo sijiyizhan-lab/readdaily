@@ -108,9 +108,24 @@ struct ReadDailyCommandTests {
         )
 
         #expect(request.arguments == [
-            "/Users/test/readdaily/scripts/readdaily.py", "fetch", "--date", "2026-09-03",
+            "/Users/test/readdaily/skills/newspaper-fetch/scripts/fetch.py",
+            "--registry", "/Users/test/readdaily/skills/newspaper-fetch/sources.json",
+            "--date", "2026-09-03",
         ])
         #expect(!request.arguments.contains("--source"))
+    }
+
+    @Test("中国建设报抓取直接调用包内抓取器并保留来源范围")
+    func constructionFetchUsesDirectFetcherAndRegistry() throws {
+        let request = try ReadDailyCommandFactory(configuration: configuration).make(
+            .fetchConstruction(date: "2026-09-01")
+        )
+
+        #expect(request.arguments == [
+            "/Users/test/readdaily/skills/newspaper-fetch/scripts/fetch.py",
+            "--registry", "/Users/test/readdaily/skills/newspaper-fetch/sources.json",
+            "--source", "zgjsb", "--date", "2026-09-01",
+        ])
     }
 
     @Test("客户端校验 API 命令实际使用的工作台脚本")

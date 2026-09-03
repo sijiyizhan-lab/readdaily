@@ -6,6 +6,182 @@ import Testing
 @Suite("Read Daily 导航状态一致性", .serialized)
 @MainActor
 struct ReadingDeskNavigationStateTests {
+    @Test("整批抓取期间保留当前报纸并允许即时换版")
+    func editionNavigationRemainsResponsiveDuringDailyFetch() async throws {
+        let environment = try TestEnvironment()
+        defer { environment.cleanup() }
+        let viewModel = environment.makeViewModel()
+        await loadInitialIssue(in: viewModel)
+
+        await environment.runner.holdFetch(date: TestEnvironment.today)
+        viewModel.fetchDailyPapers()
+        await waitUntil {
+            await environment.runner.fetchRequestCount(date: TestEnvironment.today) == 1
+        }
+        #expect(viewModel.isFetchingDaily)
+        #expect(!viewModel.isBusy)
+        #expect(viewModel.canNavigateEditions)
+        #expect(viewModel.issueDetail?.sourceID == "zgjsb")
+
+        viewModel.selectEdition("zgjsb-page-2")
+        #expect(viewModel.selectedEditionID == "zgjsb-page-2")
+        #expect(viewModel.editorState?.draft.id == "zgjsb-page-2")
+
+        await environment.runner.releaseFetch(date: TestEnvironment.today)
+        await waitUntilSettled(viewModel)
+        #expect(viewModel.issueDetail?.sourceID == "zgjsb")
+        #expect(viewModel.selectedEditionID == "zgjsb-page-2")
+        #expect(!viewModel.isFetchingDaily)
+        #expect(viewModel.presentedError == nil)
+    }
+
+    @Test("整批抓取期间可切换到其他报纸且结果不会被回载覆盖")
+    func newspaperNavigationRemainsResponsiveDuringDailyFetch() async throws {
+        let environment = try TestEnvironment()
+        defer { environment.cleanup() }
+        let viewModel = environment.makeViewModel()
+        await loadInitialIssue(in: viewModel)
+
+        await environment.runner.holdFetch(date: TestEnvironment.today)
+        viewModel.fetchDailyPapers()
+        await waitUntil {
+            await environment.runner.fetchRequestCount(date: TestEnvironment.today) == 1
+        }
+
+        viewModel.selectIssue("kjrb-\(TestEnvironment.today)")
+        await waitUntil {
+            viewModel.issueDetail?.sourceID == "kjrb" && viewModel.isFetchingDaily
+        }
+        #expect(viewModel.selectedIssueID == "kjrb-\(TestEnvironment.today)")
+        #expect(viewModel.issueDetail?.sourceID == "kjrb")
+        #expect(!viewModel.isBusy)
+
+        await environment.runner.releaseFetch(date: TestEnvironment.today)
+        await waitUntilSettled(viewModel)
+        #expect(viewModel.selectedIssueID == "kjrb-\(TestEnvironment.today)")
+        #expect(viewModel.issueDetail?.sourceID == "kjrb")
+        #expect(await environment.runner.issueRequestCount(
+            source: "kjrb",
+            date: TestEnvironment.today
+        ) == 2)
+        #expect(viewModel.presentedError == nil)
+    }
+
+    @Test("抓取开始后迟到的输入法编辑会被保留且阻止自动回载")
+    func delayedEditorSetterSurvivesDailyFetchCompletion() async throws {
+        let environment = try TestEnvironment()
+        defer { environment.cleanup() }
+        let viewModel = environment.makeViewModel()
+        await loadInitialIssue(in: viewModel)
+
+        let issueRequestsBeforeFetch = await environment.runner.issueRequestCount(
+            source: "zgjsb",
+            date: TestEnvironment.today
+        )
+        await environment.runner.holdFetch(date: TestEnvironment.today)
+        viewModel.fetchDailyPapers()
+        await waitUntil {
+            await environment.runner.fetchRequestCount(date: TestEnvironment.today) == 1
+        }
+
+        // Simulate a TextField/IME setter that was queued immediately before
+        // the editor became disabled for the background fetch.
+        viewModel.updateTitle("输入法延迟提交的标题")
+        #expect(viewModel.editorState?.draft.title == "输入法延迟提交的标题")
+        #expect(viewModel.hasUnsavedChanges)
+
+        await environment.runner.releaseFetch(date: TestEnvironment.today)
+        await waitUntilSettled(viewModel)
+
+        #expect(viewModel.editorState?.draft.title == "输入法延迟提交的标题")
+        #expect(viewModel.hasUnsavedChanges)
+        #expect(await environment.runner.issueRequestCount(
+            source: "zgjsb",
+            date: TestEnvironment.today
+        ) == issueRequestsBeforeFetch)
+        #expect(viewModel.notice == "抓取完成；当前未保存编辑已保留，请保存后再刷新本报。")
+        #expect(viewModel.presentedError == nil)
+    }
+
+    @Test("旧版次迟到的输入回调不会污染已经切换的新版本")
+    func staleEditorSetterCannotMutateNewlySelectedEdition() async throws {
+        let environment = try TestEnvironment()
+        defer { environment.cleanup() }
+        let viewModel = environment.makeViewModel()
+        await loadInitialIssue(in: viewModel)
+
+        await environment.runner.holdFetch(date: TestEnvironment.today)
+        viewModel.fetchDailyPapers()
+        await waitUntil {
+            await environment.runner.fetchRequestCount(date: TestEnvironment.today) == 1
+        }
+
+        viewModel.selectEdition("zgjsb-page-2")
+        let secondEditionTitle = viewModel.editorState?.draft.title
+        viewModel.updateTitle(
+            "第一版迟到的输入",
+            expectedEditionID: "zgjsb-page-1"
+        )
+
+        #expect(viewModel.selectedEditionID == "zgjsb-page-2")
+        #expect(viewModel.editorState?.draft.title == secondEditionTitle)
+        #expect(!viewModel.hasUnsavedChanges)
+
+        await environment.runner.releaseFetch(date: TestEnvironment.today)
+        await waitUntilSettled(viewModel)
+        #expect(viewModel.selectedEditionID == "zgjsb-page-2")
+        #expect(viewModel.editorState?.draft.title == secondEditionTitle)
+        #expect(viewModel.presentedError == nil)
+    }
+
+    @Test("抓取失败会复位独立进度状态并继续允许换版")
+    func failedDailyFetchRestoresResponsiveNavigation() async throws {
+        let environment = try TestEnvironment()
+        defer { environment.cleanup() }
+        let viewModel = environment.makeViewModel()
+        await loadInitialIssue(in: viewModel)
+        await environment.runner.failFetch(date: TestEnvironment.today)
+
+        viewModel.fetchDailyPapers()
+        await waitUntil {
+            await environment.runner.fetchRequestCount(date: TestEnvironment.today) == 1
+                && !viewModel.isFetchingDaily
+        }
+
+        #expect(!viewModel.isBusy)
+        #expect(viewModel.canNavigateEditions)
+        #expect(viewModel.issueDetail?.sourceID == "zgjsb")
+        #expect(viewModel.presentedError != nil)
+
+        viewModel.selectEdition("zgjsb-page-2")
+        #expect(viewModel.selectedEditionID == "zgjsb-page-2")
+    }
+
+    @Test("抓取期间拒绝拖放导入时会清理临时 PDF")
+    func busyPDFImportRemovesTemporaryDropCopy() async throws {
+        let environment = try TestEnvironment()
+        defer { environment.cleanup() }
+        let viewModel = environment.makeViewModel()
+        await loadInitialIssue(in: viewModel)
+
+        await environment.runner.holdFetch(date: TestEnvironment.today)
+        viewModel.fetchDailyPapers()
+        await waitUntil {
+            await environment.runner.fetchRequestCount(date: TestEnvironment.today) == 1
+        }
+        let temporaryPDF = environment.root.appendingPathComponent("queued-drop.pdf")
+        try Data("%PDF-1.4".utf8).write(to: temporaryPDF)
+
+        viewModel.importPDF(temporaryPDF, removeAfterImport: true)
+
+        #expect(!FileManager.default.fileExists(atPath: temporaryPDF.path))
+        #expect(viewModel.presentedError?.title == "当前操作尚未完成，不能导入 PDF。")
+        #expect(viewModel.isFetchingDaily)
+
+        await environment.runner.releaseFetch(date: TestEnvironment.today)
+        await waitUntilSettled(viewModel)
+    }
+
     @Test("大型详情映射不占用主线程，阻塞期间仍可快速切回")
     func largeIssueMappingKeepsMainActorResponsiveAndLatestWins() async throws {
         let environment = try TestEnvironment()
@@ -774,14 +950,16 @@ struct ReadingDeskNavigationStateTests {
 
     private func waitUntilIdle(_ viewModel: ReadingDeskViewModel) async {
         for _ in 0..<300 {
-            if !viewModel.isBusy { return }
+            if !viewModel.isBusy && !viewModel.isFetchingDaily { return }
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
         Issue.record("等待 ViewModel 操作结束超时")
     }
 
     private func waitUntilSettled(_ viewModel: ReadingDeskViewModel) async {
-        await waitUntil { !viewModel.isBusy && !viewModel.isIssueLoading }
+        await waitUntil {
+            !viewModel.isBusy && !viewModel.isFetchingDaily && !viewModel.isIssueLoading
+        }
     }
 
     private func waitUntil(_ condition: @escaping @MainActor () async -> Bool) async {
@@ -811,12 +989,17 @@ private final class TestEnvironment {
         let scripts = repository.appendingPathComponent("scripts", isDirectory: true)
         let workbenchScripts = repository
             .appendingPathComponent("skills/newspaper-reader/scripts", isDirectory: true)
+        let fetchScripts = repository
+            .appendingPathComponent("skills/newspaper-fetch/scripts", isDirectory: true)
         try FileManager.default.createDirectory(at: scripts, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: workbenchScripts, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: fetchScripts, withIntermediateDirectories: true)
         try Data("#!/usr/bin/env python3\n".utf8)
             .write(to: scripts.appendingPathComponent("readdaily.py"))
         try Data("#!/usr/bin/env python3\n".utf8)
             .write(to: workbenchScripts.appendingPathComponent("workbench_api.py"))
+        try Data("#!/usr/bin/env python3\n".utf8)
+            .write(to: fetchScripts.appendingPathComponent("fetch.py"))
 
         suiteName = "ReadDailyNavigationTests.\(UUID().uuidString)"
         defaults = try #require(UserDefaults(suiteName: suiteName))
@@ -931,10 +1114,15 @@ private actor NavigationStateRunner: ProcessRunning {
     private var readingMarkRequests: [String: Int] = [:]
     private var dashboardRequests = 0
     private var dashboardStatusOverrides: [String: ReadingCompletionStatus] = [:]
+    private var heldFetches: Set<String> = []
+    private var failingFetches: Set<String> = []
+    private var fetchWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+    private var fetchRequests: [String: Int] = [:]
 
     init(today: String, otherDate: String) {
         self.today = today
         self.otherDate = otherDate
+        readingStatuses["kjrb|\(today)"] = .unread
     }
 
     func failIssue(source: String, date: String) {
@@ -1057,12 +1245,47 @@ private actor NavigationStateRunner: ProcessRunning {
 
     func inboxRequestCount() -> Int { inboxRequests }
 
+    func holdFetch(date: String) {
+        heldFetches.insert(date)
+    }
+
+    func failFetch(date: String) {
+        failingFetches.insert(date)
+    }
+
+    func releaseFetch(date: String) {
+        heldFetches.remove(date)
+        fetchWaiters.removeValue(forKey: date)?.forEach { $0.resume() }
+    }
+
+    func fetchRequestCount(date: String) -> Int {
+        fetchRequests[date, default: 0]
+    }
+
     func storedReadingStatus(source: String, date: String) -> ReadingCompletionStatus {
         readingStatus(source: source, date: date)
     }
 
     func run(_ request: ProcessRequest) async throws -> ProcessResult {
         let arguments = request.arguments
+        if arguments.first?.hasSuffix("/skills/newspaper-fetch/scripts/fetch.py") == true {
+            let date = value(after: "--date", in: arguments) ?? today
+            fetchRequests[date, default: 0] += 1
+            if failingFetches.contains(date) {
+                return failure("抓取失败")
+            }
+            if heldFetches.contains(date) {
+                await withCheckedContinuation { continuation in
+                    fetchWaiters[date, default: []].append(continuation)
+                }
+            }
+            try Task.checkCancellation()
+            return ProcessResult(
+                terminationStatus: 0,
+                standardOutput: Data("fetch complete".utf8),
+                standardError: Data()
+            )
+        }
         if arguments.contains("inbox") {
             inboxRequests += 1
             let payload = inboxPayload
@@ -1158,6 +1381,7 @@ private actor NavigationStateRunner: ProcessRunning {
 
     private var inboxPayload: String {
         let constructionStatus = readingStatus(source: "zgjsb", date: today)
+        let scienceStatus = readingStatus(source: "kjrb", date: today)
         let peopleStatus = readingStatus(source: "rmrb", date: otherDate)
         let constructionReading = inboxOmitsReadingStatus
             ? ""
@@ -1168,22 +1392,27 @@ private actor NavigationStateRunner: ProcessRunning {
         return """
         {"issues":[
           {"id":"zgjsb-\(today)","source":"zgjsb","source_name":"中国建设报","date":"\(today)","stage":"needs_review"\(constructionReading),"page_count":2},
+          {"id":"kjrb-\(today)","source":"kjrb","source_name":"科技日报","date":"\(today)","stage":"needs_review","reading_status":"\(scienceStatus.rawValue)","page_count":1},
           {"id":"rmrb-\(otherDate)","source":"rmrb","source_name":"人民日报","date":"\(otherDate)","stage":"needs_review"\(peopleReading),"page_count":1}
         ]}
         """
     }
 
     private func dashboardPayload(date: String) -> String {
-        let source = date == otherDate ? "rmrb" : "zgjsb"
-        let sourceName = source == "rmrb" ? "人民日报" : "中国建设报"
-        let requestKey = key(source: source, date: date)
-        let status = dashboardStatusOverrides[requestKey]
-            ?? readingStatus(source: source, date: date)
-        let revision = readingRevisions[requestKey, default: 0]
+        let sources = date == otherDate
+            ? [("rmrb", "人民日报")]
+            : [("zgjsb", "中国建设报"), ("kjrb", "科技日报")]
+        let newspapers = sources.map { source, sourceName in
+            let requestKey = key(source: source, date: date)
+            let status = dashboardStatusOverrides[requestKey]
+                ?? readingStatus(source: source, date: date)
+            let revision = readingRevisions[requestKey, default: 0]
+            return """
+            {"id":"\(source)-\(date)","source":"\(source)","source_name":"\(sourceName)","date":"\(date)","available":true,"stage":"needs_review","reading_status":"\(status.rawValue)","reading_revision":\(revision)}
+            """
+        }.joined(separator: ",")
         return """
-        {"date":"\(date)","available_dates":["\(today)","\(otherDate)"],"newspapers":[
-          {"id":"\(source)-\(date)","source":"\(source)","source_name":"\(sourceName)","date":"\(date)","available":true,"stage":"needs_review","reading_status":"\(status.rawValue)","reading_revision":\(revision)}
-        ]}
+        {"date":"\(date)","available_dates":["\(today)","\(otherDate)"],"newspapers":[\(newspapers)]}
         """
     }
 
@@ -1202,9 +1431,14 @@ private actor NavigationStateRunner: ProcessRunning {
     }
 
     private func issuePayload(source: String, date: String) -> String {
-        let sourceName = source == "rmrb" ? "人民日报" : "中国建设报"
-        let prefix = source == "rmrb" ? "rmrb" : "zgjsb"
-        let unitCount = source == "rmrb" ? 1 : 2
+        let sourceName: String
+        switch source {
+        case "rmrb": sourceName = "人民日报"
+        case "kjrb": sourceName = "科技日报"
+        default: sourceName = "中国建设报"
+        }
+        let prefix = source
+        let unitCount = source == "zgjsb" ? 2 : 1
         let units = (1...unitCount).map { number in
             """
             {"id":"\(prefix)-page-\(number)","edition_no":\(number),"edition_name":"第\(number)版","title":"第\(number)版原始标题","ocr_text":"第\(number)版 OCR 原文","summary":"第\(number)版原始摘要","topics":["城市更新与城市治理"],"facts":[],"importance":3}

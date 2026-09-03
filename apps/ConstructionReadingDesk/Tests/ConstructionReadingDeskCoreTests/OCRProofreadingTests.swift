@@ -100,4 +100,20 @@ struct OCRProofreadingTests {
         #expect(layout.paragraphs[1].lines == ["第二段"])
         #expect(layout.verbatimText == text)
     }
+
+    @Test("长 OCR 在草稿创建时一次性生成稳定结构块")
+    func longOCRPrecomputesStableFallbackBlocks() {
+        let paragraphs = (0..<2_000).map { index in
+            "第 \(index) 段第一行\n  第 \(index) 段缩进第二行"
+        }
+        let text = paragraphs.joined(separator: "\n\n")
+
+        let draft = ArticleDraft(id: "long-page", title: "长版面", ocrText: text)
+
+        #expect(draft.ocrBlocks.count == paragraphs.count)
+        #expect(draft.ocrBlocks.first?.text == paragraphs.first)
+        #expect(draft.ocrBlocks.last?.text == paragraphs.last)
+        #expect(draft.ocrBlocks.map(\.text).joined(separator: "\n\n") == text)
+        #expect(draft.ocrText == text)
+    }
 }

@@ -5,52 +5,151 @@ import ImageIO
 import PDFKit
 import SwiftUI
 
+@MainActor
 enum ReadDailyResource {
+    private static let imageCache = NSCache<NSString, NSImage>()
+
     static func url(forResource name: String, withExtension extensionName: String) -> URL? {
         Bundle.main.url(forResource: name, withExtension: extensionName)
     }
+
+    static func image(forResource name: String, withExtension extensionName: String) -> NSImage? {
+        let key = "\(name).\(extensionName)" as NSString
+        if let cached = imageCache.object(forKey: key) { return cached }
+        guard let url = url(forResource: name, withExtension: extensionName),
+              let image = NSImage(contentsOf: url) else { return nil }
+        imageCache.setObject(image, forKey: key)
+        return image
+    }
 }
 
-private actor PageImageRepository {
-    static let shared = PageImageRepository()
+enum PageImageSourceKind: String, Sendable {
+    case image
+    case pdf
+}
 
-    private let cache: NSCache<NSString, NSImage> = {
-        let cache = NSCache<NSString, NSImage>()
-        cache.totalCostLimit = 192 * 1_024 * 1_024
-        cache.countLimit = 48
-        return cache
-    }()
+struct PageImageDecodeRequest: Hashable, Sendable {
+    let sourcePath: String
+    let sourceKind: PageImageSourceKind
+    let modificationRevision: UInt64
+    let fileSize: UInt64
+    let pageIndex: Int
+    let targetPixels: Int
 
-    func image(imagePath: String?, pdfPath: String?, pageIndex: Int, targetPixels: Int) -> NSImage? {
-        guard let source = imagePath ?? pdfPath else { return nil }
-        let modified = ((try? FileManager.default.attributesOfItem(atPath: source)[.modificationDate]) as? Date)?.timeIntervalSince1970 ?? 0
-        let key = "\(source)|\(modified)|\(pageIndex)|\(targetPixels)" as NSString
-        if let cached = cache.object(forKey: key) { return cached }
+    fileprivate var cacheKey: String {
+        "\(sourceKind.rawValue)|\(sourcePath)|\(modificationRevision)|\(fileSize)|\(pageIndex)|\(targetPixels)"
+    }
 
-        let image: NSImage?
-        if let imagePath, FileManager.default.fileExists(atPath: imagePath) {
-            image = downsample(URL(fileURLWithPath: imagePath), targetPixels: targetPixels)
-        } else if let pdfPath, let document = PDFDocument(url: URL(fileURLWithPath: pdfPath)),
-                  let page = document.page(at: min(max(pageIndex, 0), max(document.pageCount - 1, 0))) {
+    fileprivate var sourceRevisionKey: String {
+        "\(sourceKind.rawValue)|\(sourcePath)|\(modificationRevision)|\(fileSize)|\(pageIndex)"
+    }
+}
+
+final class SendablePageImage: @unchecked Sendable {
+    // Decoders create an immutable image representation off-main. Consumers only
+    // hand it to SwiftUI on the main actor and never mutate it after publication.
+    let image: NSImage
+
+    init(_ image: NSImage) {
+        self.image = image
+    }
+}
+
+private actor PageImageDecodePermitPool {
+    private struct Waiter {
+        let id: UUID
+        let continuation: CheckedContinuation<Bool, Never>
+    }
+
+    private let limit: Int
+    private var available: Int
+    private var waiters: [Waiter] = []
+
+    init(limit: Int) {
+        self.limit = max(limit, 1)
+        available = max(limit, 1)
+    }
+
+    func acquire(waiterID: UUID) async -> Bool {
+        guard !Task.isCancelled else { return false }
+        if available > 0 {
+            available -= 1
+            return true
+        }
+        return await withCheckedContinuation { continuation in
+            waiters.append(Waiter(id: waiterID, continuation: continuation))
+        }
+    }
+
+    func cancel(waiterID: UUID) {
+        guard let index = waiters.firstIndex(where: { $0.id == waiterID }) else { return }
+        let waiter = waiters.remove(at: index)
+        waiter.continuation.resume(returning: false)
+    }
+
+    func release() {
+        if waiters.isEmpty {
+            available = min(available + 1, limit)
+        } else {
+            let waiter = waiters.removeFirst()
+            waiter.continuation.resume(returning: true)
+        }
+    }
+}
+
+private final class PageImageDecodeScheduler: @unchecked Sendable {
+    private let interactivePool: PageImageDecodePermitPool
+    private let utilityPool: PageImageDecodePermitPool
+
+    init(interactiveLimit: Int = 2, utilityLimit: Int = 2) {
+        interactivePool = PageImageDecodePermitPool(limit: interactiveLimit)
+        utilityPool = PageImageDecodePermitPool(limit: utilityLimit)
+    }
+
+    func decode(
+        priority: TaskPriority,
+        operation: @escaping @Sendable () async -> SendablePageImage?
+    ) async -> SendablePageImage? {
+        let pool = priority == .utility || priority == .background ? utilityPool : interactivePool
+        let waiterID = UUID()
+        let acquired = await withTaskCancellationHandler {
+            await pool.acquire(waiterID: waiterID)
+        } onCancel: {
+            Task { await pool.cancel(waiterID: waiterID) }
+        }
+        guard acquired else { return nil }
+        guard !Task.isCancelled else {
+            await pool.release()
+            return nil
+        }
+        let decoded = await operation()
+        await pool.release()
+        return decoded
+    }
+}
+
+enum PageImageDecoder {
+    static func decode(_ request: PageImageDecodeRequest) -> NSImage? {
+        switch request.sourceKind {
+        case .image:
+            return downsample(URL(fileURLWithPath: request.sourcePath), targetPixels: request.targetPixels)
+        case .pdf:
+            guard let document = PDFDocument(url: URL(fileURLWithPath: request.sourcePath)),
+                  document.pageCount > 0,
+                  let page = document.page(at: min(max(request.pageIndex, 0), document.pageCount - 1)) else {
+                return nil
+            }
             let bounds = page.bounds(for: .mediaBox)
             let longest = max(bounds.width, bounds.height)
-            let scale = longest > 0 ? CGFloat(targetPixels) / longest : 1
-            image = page.thumbnail(
+            let scale = longest > 0 ? CGFloat(request.targetPixels) / longest : 1
+            return page.thumbnail(
                 of: NSSize(width: max(bounds.width * scale, 1), height: max(bounds.height * scale, 1)),
                 for: .mediaBox
             )
-        } else {
-            image = nil
         }
-
-        if let image {
-            let cost = max(Int(image.size.width * image.size.height * 4), 1)
-            cache.setObject(image, forKey: key, cost: cost)
-        }
-        return image
     }
 
-    private func downsample(_ url: URL, targetPixels: Int) -> NSImage? {
+    private static func downsample(_ url: URL, targetPixels: Int) -> NSImage? {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
         let options = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
@@ -60,6 +159,267 @@ private actor PageImageRepository {
         ] as CFDictionary
         guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options) else { return nil }
         return NSImage(cgImage: cgImage, size: .zero)
+    }
+}
+
+actor PageImageRepository {
+    static let shared = PageImageRepository()
+
+    typealias Decoder = @Sendable (PageImageDecodeRequest) async -> SendablePageImage?
+
+    private struct InFlightRequest {
+        let id: UUID
+        let task: Task<SendablePageImage?, Never>
+        var waiters: Set<UUID>
+    }
+
+    private struct CachedVariantID: Hashable {
+        let sourceRevisionKey: String
+        let targetPixels: Int
+    }
+
+    private let cache: NSCache<NSString, NSImage>
+    private let decoder: Decoder
+    private let scheduler: PageImageDecodeScheduler
+    private let cachedVariantLimit: Int
+    private var inFlight: [String: InFlightRequest] = [:]
+    // NSCache owns image lifetimes. This bounded side index stores only cache
+    // keys, allowing a larger request to reuse an already-rendered thumbnail
+    // as an exact-page placeholder without retaining evicted images.
+    private var cachedVariantKeys: [CachedVariantID: String] = [:]
+    private var cachedVariantOrder: [CachedVariantID] = []
+
+    init(
+        totalCostLimit: Int = 192 * 1_024 * 1_024,
+        countLimit: Int = 48,
+        interactiveDecodeLimit: Int = 2,
+        utilityDecodeLimit: Int = 2,
+        decoder: @escaping Decoder = { request in PageImageDecoder.decode(request).map(SendablePageImage.init) }
+    ) {
+        let cache = NSCache<NSString, NSImage>()
+        cache.totalCostLimit = totalCostLimit
+        cache.countLimit = countLimit
+        self.cache = cache
+        self.decoder = decoder
+        cachedVariantLimit = max(countLimit > 0 ? countLimit * 2 : 96, 16)
+        scheduler = PageImageDecodeScheduler(
+            interactiveLimit: interactiveDecodeLimit,
+            utilityLimit: utilityDecodeLimit
+        )
+    }
+
+    func image(
+        imagePath: String?,
+        pdfPath: String?,
+        pageIndex: Int,
+        targetPixels: Int,
+        priority: TaskPriority = .userInitiated
+    ) async -> SendablePageImage? {
+        let requests = resolvedRequests(
+            imagePath: imagePath,
+            pdfPath: pdfPath,
+            pageIndex: pageIndex,
+            targetPixels: targetPixels
+        )
+        for request in requests {
+            guard !Task.isCancelled else { return nil }
+            if let decoded = await image(for: request, priority: priority) { return decoded }
+        }
+        return nil
+    }
+
+    func cachedLowerResolutionImage(
+        imagePath: String?,
+        pdfPath: String?,
+        pageIndex: Int,
+        targetPixels: Int
+    ) -> SendablePageImage? {
+        let requests = resolvedRequests(
+            imagePath: imagePath,
+            pdfPath: pdfPath,
+            pageIndex: pageIndex,
+            targetPixels: targetPixels
+        )
+        for request in requests {
+            if let image = bestCachedLowerResolutionImage(for: request) {
+                return SendablePageImage(image)
+            }
+        }
+        return nil
+    }
+
+    private func image(for request: PageImageDecodeRequest, priority: TaskPriority) async -> SendablePageImage? {
+        let key = request.cacheKey
+        if let cached = cache.object(forKey: key as NSString) {
+            recordCachedVariant(request)
+            return SendablePageImage(cached)
+        }
+
+        let waiterID = UUID()
+        let operationID: UUID
+        let operation: Task<SendablePageImage?, Never>
+        if var existing = inFlight[key] {
+            existing.waiters.insert(waiterID)
+            inFlight[key] = existing
+            operationID = existing.id
+            operation = existing.task
+        } else {
+            let decoder = self.decoder
+            let scheduler = self.scheduler
+            let task = Task.detached(priority: priority) { () -> SendablePageImage? in
+                guard !Task.isCancelled else { return nil }
+                return await scheduler.decode(priority: priority) {
+                    guard !Task.isCancelled else { return nil }
+                    return await decoder(request)
+                }
+            }
+            let id = UUID()
+            inFlight[key] = InFlightRequest(id: id, task: task, waiters: [waiterID])
+            operationID = id
+            operation = task
+        }
+
+        return await withTaskCancellationHandler {
+            let decoded = await operation.value
+            return finish(
+                decoded,
+                request: request,
+                operationID: operationID,
+                waiterID: waiterID
+            )
+        } onCancel: {
+            Task {
+                await self.cancelWaiter(
+                    key: key,
+                    operationID: operationID,
+                    waiterID: waiterID
+                )
+            }
+        }
+    }
+
+    private func resolvedRequests(
+        imagePath: String?,
+        pdfPath: String?,
+        pageIndex: Int,
+        targetPixels: Int
+    ) -> [PageImageDecodeRequest] {
+        let candidates: [(String?, PageImageSourceKind)] = [
+            (imagePath, .image),
+            (pdfPath, .pdf),
+        ]
+        return candidates.compactMap { path, kind in
+            guard let path, !path.isEmpty,
+                  let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+                  (attributes[.type] as? FileAttributeType) != .typeDirectory else { return nil }
+            let modified = (attributes[.modificationDate] as? Date)?.timeIntervalSinceReferenceDate.bitPattern ?? 0
+            let fileSize = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
+            return PageImageDecodeRequest(
+                sourcePath: path,
+                sourceKind: kind,
+                modificationRevision: modified,
+                fileSize: fileSize,
+                pageIndex: max(pageIndex, 0),
+                targetPixels: max(targetPixels, 64)
+            )
+        }
+    }
+
+    private func finish(
+        _ decoded: SendablePageImage?,
+        request: PageImageDecodeRequest,
+        operationID: UUID,
+        waiterID: UUID
+    ) -> SendablePageImage? {
+        let key = request.cacheKey
+        guard var inFlightRequest = inFlight[key],
+              inFlightRequest.id == operationID,
+              inFlightRequest.waiters.remove(waiterID) != nil else { return nil }
+
+        let wasCancelled = Task.isCancelled
+        if !wasCancelled, let decoded {
+            let cost = max(Int(decoded.image.size.width * decoded.image.size.height * 4), 1)
+            cache.setObject(decoded.image, forKey: key as NSString, cost: cost)
+            recordCachedVariant(request: request, cacheKey: key)
+        }
+        if inFlightRequest.waiters.isEmpty {
+            inFlight.removeValue(forKey: key)
+        } else {
+            inFlight[key] = inFlightRequest
+        }
+        return wasCancelled ? nil : decoded
+    }
+
+    private func bestCachedLowerResolutionImage(for request: PageImageDecodeRequest) -> NSImage? {
+        let candidates = cachedVariantKeys.keys
+            .filter {
+                $0.sourceRevisionKey == request.sourceRevisionKey
+                    && $0.targetPixels < request.targetPixels
+            }
+            .sorted { $0.targetPixels > $1.targetPixels }
+        for candidate in candidates {
+            guard let cacheKey = cachedVariantKeys[candidate],
+                  let image = cache.object(forKey: cacheKey as NSString) else {
+                removeCachedVariant(candidate)
+                continue
+            }
+            touchCachedVariant(candidate)
+            return image
+        }
+        return nil
+    }
+
+    private func recordCachedVariant(_ request: PageImageDecodeRequest) {
+        recordCachedVariant(request: request, cacheKey: request.cacheKey)
+    }
+
+    private func recordCachedVariant(request: PageImageDecodeRequest, cacheKey: String) {
+        let variant = CachedVariantID(
+            sourceRevisionKey: request.sourceRevisionKey,
+            targetPixels: request.targetPixels
+        )
+        cachedVariantKeys[variant] = cacheKey
+        touchCachedVariant(variant)
+        while cachedVariantOrder.count > cachedVariantLimit {
+            removeCachedVariant(cachedVariantOrder[0])
+        }
+    }
+
+    private func touchCachedVariant(_ variant: CachedVariantID) {
+        cachedVariantOrder.removeAll { $0 == variant }
+        cachedVariantOrder.append(variant)
+    }
+
+    private func removeCachedVariant(_ variant: CachedVariantID) {
+        cachedVariantKeys.removeValue(forKey: variant)
+        cachedVariantOrder.removeAll { $0 == variant }
+    }
+
+    private func cancelWaiter(key: String, operationID: UUID, waiterID: UUID) {
+        guard var request = inFlight[key],
+              request.id == operationID,
+              request.waiters.remove(waiterID) != nil else { return }
+        if request.waiters.isEmpty {
+            inFlight.removeValue(forKey: key)
+            request.task.cancel()
+        } else {
+            inFlight[key] = request
+        }
+    }
+
+    func activeWaiterCount(
+        imagePath: String?,
+        pdfPath: String?,
+        pageIndex: Int,
+        targetPixels: Int
+    ) -> Int {
+        guard let request = resolvedRequests(
+            imagePath: imagePath,
+            pdfPath: pdfPath,
+            pageIndex: pageIndex,
+            targetPixels: targetPixels
+        ).first else { return 0 }
+        return inFlight[request.cacheKey]?.waiters.count ?? 0
     }
 }
 
@@ -78,9 +438,19 @@ final class PageImageLoadCoordinator<Value>: ObservableObject {
 
     func load(
         requestID: String,
+        placeholder: (() async -> Value?)? = nil,
         operation: () async -> Value?
     ) async {
         let request = begin(requestID: requestID)
+        if let placeholder {
+            let placeholderValue = await placeholder()
+            guard !Task.isCancelled, activeRequest == request else {
+                finishCancellation(for: request)
+                return
+            }
+            if let placeholderValue { value = placeholderValue }
+        }
+
         let loadedValue = await operation()
 
         guard !Task.isCancelled, activeRequest == request else {
@@ -88,7 +458,10 @@ final class PageImageLoadCoordinator<Value>: ObservableObject {
             return
         }
 
-        value = loadedValue
+        // Keep the exact-page low-resolution placeholder if the optional
+        // high-resolution decode fails. It is more useful than flashing back
+        // to an empty state and never represents a different page revision.
+        if let loadedValue { value = loadedValue }
         isLoading = false
     }
 
@@ -112,6 +485,7 @@ struct AsyncPageImage: View {
     let pdfPath: String?
     let pageIndex: Int
     var targetPixels = 1_200
+    var requestPriority: TaskPriority?
     var contentMode: ContentMode = .fit
     var accessibilityText = "报纸原版图"
 
@@ -151,14 +525,29 @@ struct AsyncPageImage: View {
         .clipped()
         .task(id: loadID) {
             let requestID = loadID
-            await loader.load(requestID: requestID) {
-                await PageImageRepository.shared.image(
-                    imagePath: imagePath,
-                    pdfPath: pdfPath,
-                    pageIndex: pageIndex,
-                    targetPixels: targetPixels
-                )
-            }
+            let repository = PageImageRepository.shared
+            await loader.load(
+                requestID: requestID,
+                placeholder: {
+                    let cached = await repository.cachedLowerResolutionImage(
+                        imagePath: imagePath,
+                        pdfPath: pdfPath,
+                        pageIndex: pageIndex,
+                        targetPixels: targetPixels
+                    )
+                    return cached?.image
+                },
+                operation: {
+                    let loaded = await repository.image(
+                        imagePath: imagePath,
+                        pdfPath: pdfPath,
+                        pageIndex: pageIndex,
+                        targetPixels: targetPixels,
+                        priority: requestPriority ?? (targetPixels <= 320 ? .utility : .userInitiated)
+                    )
+                    return loaded?.image
+                }
+            )
         }
     }
 }
@@ -270,8 +659,7 @@ struct ReadDailyLogo: View {
 
     var body: some View {
         Group {
-            if let url = ReadDailyResource.url(forResource: "readdaily-icon", withExtension: "svg"),
-               let image = NSImage(contentsOf: url) {
+            if let image = ReadDailyResource.image(forResource: "readdaily-icon", withExtension: "svg") {
                 Image(nsImage: image)
                     .resizable()
                     .scaledToFit()

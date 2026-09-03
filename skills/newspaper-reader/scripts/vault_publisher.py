@@ -11,6 +11,7 @@ import contextlib
 import ctypes
 import datetime as _datetime
 import difflib
+import errno
 import fcntl
 import functools
 import hashlib
@@ -45,7 +46,21 @@ _PUBLISH_THREAD_LOCKS = {}
 _PUBLISH_THREAD_LOCKS_GUARD = threading.Lock()
 _DRAFT_THREAD_LOCKS = {}
 _DRAFT_THREAD_LOCKS_GUARD = threading.Lock()
+_SOURCE_EVIDENCE_THREAD_LOCKS = {}
+_SOURCE_EVIDENCE_THREAD_LOCKS_GUARD = threading.Lock()
 _PUBLISH_IO_CONTEXT = threading.local()
+_SYSTEM_TEMP_ROOT = "/private/tmp" if sys.platform == "darwin" else "/tmp"
+READDAILY_USER_LOCK_ROOT = os.path.join(
+    _SYSTEM_TEMP_ROOT, "readdaily-%s" % os.geteuid()
+)
+READDAILY_LOCK_ROOT = os.path.join(
+    READDAILY_USER_LOCK_ROOT, "locks"
+)
+SOURCE_EVIDENCE_LOCK_ROOT = os.path.join(
+    READDAILY_LOCK_ROOT, "source-evidence"
+)
+WORKBENCH_LOCK_ROOT = os.path.join(READDAILY_LOCK_ROOT, "workbench")
+PUBLISHER_LOCK_ROOT = os.path.join(READDAILY_LOCK_ROOT, "publisher")
 DEFAULT_PUBLISHER_STATE_ROOT = Path(
     "~/Library/Application Support/readdaily/publisher-state"
 ).expanduser()
@@ -66,6 +81,12 @@ class PublisherError(RuntimeError):
 
 class PathSafetyError(PublisherError):
     """A destination escaped the configured Vault boundary."""
+
+
+class SourceEvidenceBusyError(PublisherError):
+    """The requested source/date evidence is being replaced."""
+
+    code = "source_updating"
 
 
 class ConflictError(PublisherError):
@@ -125,6 +146,27 @@ def _directory_open_flags():
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     return flags
+
+
+def _open_lock_file_at(directory_fd, name, mode=0o600):
+    """Race-safely create or open one no-follow process lock file."""
+    flags = os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    for _attempt in range(8):
+        try:
+            return os.open(
+                name, flags | os.O_CREAT | os.O_EXCL, mode,
+                dir_fd=directory_fd,
+            )
+        except FileExistsError:
+            try:
+                return os.open(name, flags, dir_fd=directory_fd)
+            except FileNotFoundError:
+                continue
+    raise FileNotFoundError(
+        errno.ENOENT, "锁文件在创建期间反复变化", name
+    )
 
 
 def _fd_canonical_path(descriptor):
@@ -819,65 +861,211 @@ def _safe_archive_path(archive_root, *parts):
     return Path(target)
 
 
+def _source_lock_archive_identity(archive_root):
+    """Derive the source lock key from a pinned archive root inode."""
+    configured = os.path.abspath(os.path.expanduser(str(archive_root)))
+    if sys.platform == "darwin":
+        for alias, canonical in (
+                ("/var", "/private/var"),
+                ("/tmp", "/private/tmp"),
+                ("/etc", "/private/etc"),
+        ):
+            if configured == alias or configured.startswith(alias + os.sep):
+                configured = canonical + configured[len(alias):]
+                break
+    active = _active_archive_session()
+    if (active is not None
+            and configured in (
+                active["configured_path"], active["canonical_path"]
+            )):
+        _verify_pinned_directory(active, "归档根目录")
+        device, inode = active["root_identity"]
+        return "inode:%s:%s" % (device, inode)
+
+    label = "报纸来源证据锁归档根"
+    with _pinned_directory(configured, label) as pinned:
+        _verify_pinned_directory(pinned, label)
+        device, inode = pinned["root_identity"]
+        return "inode:%s:%s" % (device, inode)
+
+
 @contextlib.contextmanager
-def _fetch_date_evidence_lock(archive_root, day):
-    """Share fetch.py's per-archive/day lock while validating source evidence."""
+def _trusted_user_lock_directory(root, label):
+    """Pin one TMPDIR-independent lock directory and all mutable ancestors."""
+    root = os.path.abspath(root)
+    user_root = os.path.abspath(READDAILY_USER_LOCK_ROOT)
     try:
-        normalized_day = _datetime.date.fromisoformat(str(day)).isoformat()
+        if os.path.commonpath([user_root, root]) != user_root:
+            raise PathSafetyError(
+                "%s必须位于固定的当前用户锁根目录" % label
+            )
+    except ValueError as exc:
+        raise PathSafetyError("%s无法安全绑定" % label) from exc
+    with _pinned_directory(
+            root, label, create=True, mode=0o700) as pinned:
+        _verify_pinned_directory(pinned, label)
+        root_parts = [part for part in root.split(os.sep) if part]
+        user_parts = [part for part in user_root.split(os.sep) if part]
+        if root_parts[:len(user_parts)] != user_parts:
+            raise PathSafetyError("%s固定根目录身份不一致" % label)
+        for _parent_fd, _name, child_fd, _identity in pinned[
+                "configured_links"][len(user_parts) - 1:]:
+            try:
+                info = os.fstat(child_fd)
+            except OSError as exc:
+                raise PathSafetyError("%s祖先无法安全校验" % label) from exc
+            if (not stat.S_ISDIR(info.st_mode)
+                    or info.st_uid != os.geteuid()
+                    or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+                raise PathSafetyError(
+                    "%s及其用户级祖先必须由当前用户持有且不可被他人写入"
+                    % label
+                )
+        yield pinned["root_fd"], pinned["canonical_path"]
+        _verify_pinned_directory(pinned, label)
+
+
+@contextlib.contextmanager
+def _source_evidence_lock_directory():
+    with _trusted_user_lock_directory(
+            SOURCE_EVIDENCE_LOCK_ROOT, "报纸来源证据锁目录") as opened:
+        yield opened
+
+
+def _source_evidence_lock_path(archive_root, source, day):
+    """Mirror fetch.py's canonical cross-process source/date lock identity."""
+    if (not isinstance(source, str)
+            or not re.fullmatch(
+                r"[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?", source
+            )):
+        raise PublisherError("报纸来源 id 无效")
+    try:
+        if isinstance(day, _datetime.datetime):
+            normalized_day = day.date().isoformat()
+        elif isinstance(day, _datetime.date):
+            normalized_day = day.isoformat()
+        else:
+            normalized_day = _datetime.date.fromisoformat(str(day)).isoformat()
     except (TypeError, ValueError) as exc:
         raise PublisherError("发布日期无效") from exc
-    archive_identity = _canonical_archive_root(archive_root)
-    archive_key = hashlib.sha256(archive_identity.encode("utf-8")).hexdigest()
-    lock_directory = os.path.join(
-        tempfile.gettempdir(), "readdaily-fetch-locks", archive_key
+    archive_identity = _source_lock_archive_identity(archive_root)
+    lock_key = hashlib.sha256((
+        archive_identity + "\0source-evidence\0"
+        + source + "\0" + normalized_day
+    ).encode("utf-8")).hexdigest()
+    lock_directory = os.path.abspath(SOURCE_EVIDENCE_LOCK_ROOT)
+    return os.path.join(lock_directory, lock_key + ".lock"), lock_key
+
+
+@contextlib.contextmanager
+def _fetch_source_evidence_lock(
+        archive_root, source, day, *, blocking=True):
+    """Lock one source/date evidence tree, optionally without waiting."""
+    lock_path, lock_key = _source_evidence_lock_path(
+        archive_root, source, day
     )
-    os.makedirs(lock_directory, mode=0o700, exist_ok=True)
-    lock_path = os.path.join(lock_directory, normalized_day + ".lock")
-    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    with _SOURCE_EVIDENCE_THREAD_LOCKS_GUARD:
+        thread_lock = _SOURCE_EVIDENCE_THREAD_LOCKS.setdefault(
+            lock_key, threading.Lock()
+        )
+    acquired_thread = thread_lock.acquire(blocking=bool(blocking))
+    if not acquired_thread:
+        raise SourceEvidenceBusyError("本期报纸正在更新，请稍后重试")
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
-        yield
+        with _source_evidence_lock_directory() as (
+                lock_directory_fd, pinned_lock_directory):
+            if pinned_lock_directory != os.path.dirname(lock_path):
+                raise PathSafetyError("报纸来源证据锁目录身份不一致")
+            try:
+                descriptor = _open_lock_file_at(
+                    lock_directory_fd, os.path.basename(lock_path), 0o600,
+                )
+            except OSError as exc:
+                raise PathSafetyError("报纸来源证据锁无法安全打开") from exc
+            locked = False
+            try:
+                try:
+                    lock_info = os.fstat(descriptor)
+                    if (not stat.S_ISREG(lock_info.st_mode)
+                            or lock_info.st_uid != os.geteuid()
+                            or lock_info.st_mode
+                            & (stat.S_IWGRP | stat.S_IWOTH)):
+                        raise PathSafetyError(
+                            "报纸来源证据锁必须是当前用户持有的可信普通文件"
+                        )
+                    operation = fcntl.LOCK_EX
+                    if not blocking:
+                        operation |= fcntl.LOCK_NB
+                    fcntl.flock(descriptor, operation)
+                except OSError as exc:
+                    if (not blocking and exc.errno in {
+                            errno.EACCES, errno.EAGAIN,
+                            getattr(errno, "EWOULDBLOCK", errno.EAGAIN),
+                    }):
+                        raise SourceEvidenceBusyError(
+                            "本期报纸正在更新，请稍后重试"
+                        ) from exc
+                    raise PathSafetyError("报纸来源证据锁操作失败") from exc
+                locked = True
+                yield
+            finally:
+                if locked:
+                    try:
+                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+                os.close(descriptor)
     finally:
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-        finally:
-            os.close(descriptor)
+        thread_lock.release()
 
 
 @contextlib.contextmanager
 def _draft_rmw_lock(archive_root, source, day):
     """Serialize one persisted-draft RMW using the workbench lock identity."""
-    archive_identity = _canonical_archive_root(archive_root)
+    archive_identity = _source_lock_archive_identity(archive_root)
     scope = "draft:%s:%s" % (source, day)
     lock_key = hashlib.sha256(
         (archive_identity + "\0" + scope).encode("utf-8")
     ).hexdigest()
-    lock_directory = Path(tempfile.gettempdir()) / "readdaily-workbench-locks"
-    lock_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if lock_directory.is_symlink() or not lock_directory.is_dir():
-        raise PathSafetyError("草稿锁目录必须是真实目录")
-    lock_path = lock_directory / (lock_key + ".lock")
+    lock_directory = os.path.abspath(WORKBENCH_LOCK_ROOT)
+    lock_path = os.path.join(lock_directory, lock_key + ".lock")
     with _DRAFT_THREAD_LOCKS_GUARD:
         thread_lock = _DRAFT_THREAD_LOCKS.setdefault(lock_key, threading.RLock())
     with thread_lock:
-        flags = os.O_CREAT | os.O_RDWR
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        descriptor = os.open(str(lock_path), flags, 0o600)
-        locked = False
-        try:
-            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                raise PathSafetyError("草稿锁必须是真实普通文件")
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
-            locked = True
-            yield
-        finally:
-            if locked:
+        with _trusted_user_lock_directory(
+                lock_directory, "工作台锁目录") as (
+                    lock_directory_fd, pinned_lock_directory):
+            if pinned_lock_directory != lock_directory:
+                raise PathSafetyError("工作台锁目录身份不一致")
+            try:
+                descriptor = _open_lock_file_at(
+                    lock_directory_fd, os.path.basename(lock_path), 0o600,
+                )
+            except OSError as exc:
+                raise PathSafetyError("草稿锁无法安全打开") from exc
+            locked = False
+            try:
                 try:
-                    fcntl.flock(descriptor, fcntl.LOCK_UN)
-                except OSError:
-                    pass
-            os.close(descriptor)
+                    lock_info = os.fstat(descriptor)
+                    if (not stat.S_ISREG(lock_info.st_mode)
+                            or lock_info.st_uid != os.geteuid()
+                            or lock_info.st_mode
+                            & (stat.S_IWGRP | stat.S_IWOTH)):
+                        raise PathSafetyError(
+                            "草稿锁必须是当前用户持有的可信普通文件"
+                        )
+                    fcntl.flock(descriptor, fcntl.LOCK_EX)
+                except OSError as exc:
+                    raise PathSafetyError("草稿锁操作失败") from exc
+                locked = True
+                yield
+            finally:
+                if locked:
+                    try:
+                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+                os.close(descriptor)
 
 
 def _issue_tree_evidence_sha256(archive_root, source, day):
@@ -1010,6 +1198,139 @@ def _issue_tree_evidence_sha256(archive_root, source, day):
         except (PublisherError, OSError, UnicodeError, ValueError):
             return None
         return digest.hexdigest()
+
+
+def _issue_tree_revision_sha256(archive_root, source, day, issue=None):
+    """Return a cheap mutation token without reading page or PDF payloads.
+
+    Issue replacement is atomic, and every referenced entry contributes its
+    inode, size, mtime, and ctime.  This makes normal navigation sensitive to
+    practical archive mutations while avoiding multi-megabyte image/PDF reads.
+    Integrity-sensitive save/publish paths still call the full evidence hash.
+    """
+    archive_session = _active_archive_session()
+    if archive_session is None:
+        try:
+            with _pinned_directory(
+                    archive_root, "归档根目录") as pinned_archive:
+                _PUBLISH_IO_CONTEXT.archive_session = pinned_archive
+                try:
+                    return _issue_tree_revision_sha256(
+                        archive_root, source, day, issue=issue
+                    )
+                finally:
+                    try:
+                        del _PUBLISH_IO_CONTEXT.archive_session
+                    except AttributeError:
+                        pass
+        except (PublisherError, OSError, UnicodeError, ValueError):
+            return None
+
+    digest = hashlib.sha256()
+    digest.update(b"readdaily-issue-revision-v1\0")
+
+    def add_metadata(relative, info, kind):
+        encoded = _json_bytes({
+            "path": str(relative).replace(os.sep, "/"),
+            "kind": kind,
+            "device": info.st_dev,
+            "inode": info.st_ino,
+            "mode": stat.S_IFMT(info.st_mode),
+            "size": info.st_size,
+            "mtime_ns": info.st_mtime_ns,
+            "ctime_ns": info.st_ctime_ns,
+        })
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+
+    def visit(directory_relative, output_prefix):
+        with _archive_directory_handle(
+                archive_session, directory_relative) as handle:
+            if handle is None:
+                return False
+            _verify_archive_parent(handle)
+            try:
+                add_metadata(
+                    output_prefix or ".",
+                    os.fstat(handle["parent_fd"]),
+                    "directory",
+                )
+                names = sorted(os.listdir(handle["parent_fd"]))
+            except OSError:
+                return False
+            directories = []
+            for name in names:
+                relative = (
+                    (output_prefix + "/" if output_prefix else "") + name
+                )
+                try:
+                    info = os.stat(
+                        name, dir_fd=handle["parent_fd"],
+                        follow_symlinks=False,
+                    )
+                except OSError:
+                    return False
+                if stat.S_ISLNK(info.st_mode):
+                    return False
+                if stat.S_ISDIR(info.st_mode):
+                    add_metadata(relative, info, "directory-entry")
+                    directories.append((name, relative))
+                elif stat.S_ISREG(info.st_mode):
+                    add_metadata(relative, info, "file")
+                else:
+                    return False
+            _verify_archive_parent(handle)
+        for name, relative in directories:
+            if not visit(
+                    os.path.join(directory_relative, name), relative):
+                return False
+        return True
+
+    try:
+        issue_relative = os.path.join(str(source), str(day))
+        if not visit(issue_relative, ""):
+            return None
+        if issue is None:
+            raw = _archive_read_bytes(
+                archive_session,
+                os.path.join(issue_relative, "issue.json"),
+            )
+            issue = json.loads(raw.decode("utf-8"))
+        if not isinstance(issue, dict):
+            return None
+        files = issue.get("files")
+        files = files if isinstance(files, dict) else {}
+        pdf_reference = files.get("local_pdf") or issue.get("pdf_path")
+        if pdf_reference:
+            reference = os.path.expanduser(str(pdf_reference))
+            if not os.path.isabs(reference):
+                reference = os.path.join(
+                    archive_session["configured_path"], reference
+                )
+            pdf_relative = _session_relative_path(
+                archive_session, reference
+            )
+            if not pdf_relative:
+                return None
+            with _archive_target_parent(
+                    archive_session, pdf_relative, create=False) as handle:
+                if handle is None:
+                    return None
+                try:
+                    info = os.stat(
+                        handle["name"], dir_fd=handle["parent_fd"],
+                        follow_symlinks=False,
+                    )
+                except OSError:
+                    return None
+                if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                    return None
+                add_metadata("@source-pdf/" + pdf_relative, info, "file")
+                _verify_archive_parent(handle)
+        _verify_pinned_directory(archive_session, "归档根目录")
+    except (PublisherError, OSError, UnicodeError, ValueError):
+        return None
+    return digest.hexdigest()
 
 def validate_vault_root(vault_root):
     """Return the canonical Vault root after checking its Obsidian marker."""
@@ -2282,50 +2603,56 @@ def _publisher_transaction_lock(archive_root, vault_root):
         raise PublisherError("发布事务锁缺少固定目录会话")
     _verify_vault_session(vault_session)
     _verify_pinned_directory(archive_session, "归档根目录")
-    vault_identity = vault_session["canonical_path"]
-    archive_identity = archive_session["canonical_path"]
+    vault_device, vault_inode = vault_session["root_identity"]
+    archive_device, archive_inode = archive_session["root_identity"]
+    vault_identity = "inode:%s:%s" % (vault_device, vault_inode)
+    archive_identity = "inode:%s:%s" % (archive_device, archive_inode)
     lock_key = hashlib.sha256(vault_identity.encode("utf-8")).hexdigest()
-    lock_directory = os.path.join(
-        tempfile.gettempdir(), "readdaily-publisher-locks"
-    )
-    try:
-        os.makedirs(lock_directory, mode=0o700, exist_ok=True)
-    except OSError as exc:
-        raise PublisherError("无法创建发布锁目录：%s" % exc) from exc
-    if os.path.islink(lock_directory) or not os.path.isdir(lock_directory):
-        raise PathSafetyError("发布锁目录必须是真实目录")
-
+    lock_directory = os.path.abspath(PUBLISHER_LOCK_ROOT)
     lock_path = os.path.join(lock_directory, lock_key + ".lock")
     thread_lock = _thread_lock_for_vault(vault_identity)
     with thread_lock:
-        flags = os.O_CREAT | os.O_RDWR
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        try:
-            descriptor = os.open(lock_path, flags, 0o600)
-        except OSError as exc:
-            raise PublisherError("无法打开发布事务锁：%s" % exc) from exc
-        locked = False
-        try:
-            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                raise PathSafetyError("发布事务锁不是普通文件")
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
-            locked = True
-            os.ftruncate(descriptor, 0)
-            os.write(descriptor, (
-                "pid=%s\narchive=%s\nvault=%s\n" % (
-                    os.getpid(), archive_identity, vault_identity
+        with _trusted_user_lock_directory(
+                lock_directory, "发布事务锁目录") as (
+                    lock_directory_fd, pinned_lock_directory):
+            if pinned_lock_directory != lock_directory:
+                raise PathSafetyError("发布事务锁目录身份不一致")
+            try:
+                descriptor = _open_lock_file_at(
+                    lock_directory_fd, os.path.basename(lock_path), 0o600,
                 )
-            ).encode("utf-8"))
-            os.fsync(descriptor)
-            yield
-        finally:
-            if locked:
+            except OSError as exc:
+                raise PathSafetyError("无法安全打开发布事务锁") from exc
+            locked = False
+            try:
                 try:
-                    fcntl.flock(descriptor, fcntl.LOCK_UN)
-                except OSError:
-                    pass
-            os.close(descriptor)
+                    lock_info = os.fstat(descriptor)
+                    if (not stat.S_ISREG(lock_info.st_mode)
+                            or lock_info.st_uid != os.geteuid()
+                            or lock_info.st_mode
+                            & (stat.S_IWGRP | stat.S_IWOTH)):
+                        raise PathSafetyError(
+                            "发布事务锁必须是当前用户持有的可信普通文件"
+                        )
+                    fcntl.flock(descriptor, fcntl.LOCK_EX)
+                    locked = True
+                    os.ftruncate(descriptor, 0)
+                    os.write(descriptor, (
+                        "pid=%s\narchive=%s\nvault=%s\n" % (
+                            os.getpid(), archive_identity, vault_identity
+                        )
+                    ).encode("utf-8"))
+                    os.fsync(descriptor)
+                except OSError as exc:
+                    raise PathSafetyError("发布事务锁操作失败") from exc
+                yield
+            finally:
+                if locked:
+                    try:
+                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+                os.close(descriptor)
 
 
 def _serialized_publisher_mutation(function):
@@ -2357,7 +2684,8 @@ def _require_verified_local_pdf_date(issue):
 
 @_serialized_publisher_mutation
 def create_plan(archive_root, vault_root, issue, draft):
-    with _fetch_date_evidence_lock(archive_root, issue.get("date")):
+    with _fetch_source_evidence_lock(
+            archive_root, issue.get("source"), issue.get("date")):
         with _draft_rmw_lock(
                 archive_root, issue.get("source"), issue.get("date")):
             return _create_plan_locked(
@@ -3178,7 +3506,8 @@ def apply_plan(archive_root, vault_root, plan_id):
     for change in plan.get("changes", []):
         _safe_target(vault_root, change.get("relative_path", ""))
     _verify_plan_integrity(plan)
-    with _fetch_date_evidence_lock(archive_root, plan.get("date")):
+    with _fetch_source_evidence_lock(
+            archive_root, plan.get("source"), plan.get("date")):
         with _draft_rmw_lock(
                 archive_root, plan.get("source"), plan.get("date")):
             vault_session = _active_vault_session()
@@ -3416,10 +3745,11 @@ def _apply_plan_locked(
 @_serialized_publisher_mutation
 def rollback_transaction(archive_root, vault_root, transaction_id):
     tx_dir, manifest = _load_transaction(archive_root, transaction_id)
-    # Publisher lock is already held by the decorator.  The shared date lock
+    # Publisher lock is already held by the decorator.  The source/date lock
     # then covers every state check, Vault restore and publication-state RMW so
     # fetch cannot lose a concurrent state marker in _clear_published.
-    with _fetch_date_evidence_lock(archive_root, manifest.get("date")):
+    with _fetch_source_evidence_lock(
+            archive_root, manifest.get("source"), manifest.get("date")):
         vault_session = _active_vault_session()
         if vault_session is None:
             raise PublisherError("回滚操作缺少固定 Vault 会话")

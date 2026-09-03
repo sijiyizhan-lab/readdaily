@@ -353,6 +353,8 @@ def fetch(src, d, archive_root):
         purl = urljoin(final_url, image_href)
         try:
             st2, image_final_url, b2 = lib.http_get(purl, referer=final_url)
+        except lib.PIPELINE_FATAL_EXCEPTIONS:
+            raise
         except Exception as exc:  # noqa: BLE001
             return None, "第%s版版面图访问异常：%s" % (no, exc)
         if st2 != 200:
@@ -402,6 +404,8 @@ def fetch(src, d, archive_root):
              "units": units, "fetched_at": datetime.datetime.now().isoformat(timespec="seconds")}
     try:
         lib.commit_issue_tree(aps["dir"], page_downloads, issue)
+    except lib.PIPELINE_FATAL_EXCEPTIONS:
+        raise
     except Exception as exc:  # noqa: BLE001
         return None, "整期归档事务失败：%s" % exc
     return issue, None
@@ -446,6 +450,8 @@ def parse(src, d, archive_root, max_per_edition=20):
                 st, final_url, raw = lib.http_get(
                     a["url"], referer=u.get("url")
                 )
+            except lib.PIPELINE_FATAL_EXCEPTIONS:
+                raise
             except Exception as exc:  # noqa: BLE001
                 return issue, "第%s版第%s篇文章访问异常：%s" % (
                     unit_index, article_index, exc

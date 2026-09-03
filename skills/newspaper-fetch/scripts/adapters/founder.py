@@ -286,6 +286,8 @@ def _probe_pages(src, d, verbose=False):
         u = _fmt(tpl, d, page)
         try:
             st, final_url, raw = lib.http_get(u, referer=src.get("entry"))
+        except lib.PIPELINE_FATAL_EXCEPTIONS:
+            raise
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError("第%s版探测异常：%s" % (page, exc)) from exc
         if st in (404, 410):
@@ -323,6 +325,8 @@ def _probe_pages(src, d, verbose=False):
 def probe(src, d):
     try:
         base, n = _probe_pages(src, d, verbose=True)
+    except lib.PIPELINE_FATAL_EXCEPTIONS:
+        raise
     except RuntimeError as exc:
         return [{"node_tpl": src.get("node_tpl"), "pages_ok": 0,
                  "error": str(exc)}]
@@ -368,6 +372,8 @@ def fetch(src, d, archive_root, with_text=False, max_articles=12):
                         return None, "静态索引版面链接缺少可验证版号；整期未归档"
                     pages.append((resolved, int(page_match.group(1)), mm.group(1),
                                   re.sub(r'\s+', '', mm.group(2))))
+        except lib.PIPELINE_FATAL_EXCEPTIONS:
+            raise
         except Exception:  # noqa: BLE001
             return None, "静态索引读取失败，无法确认请求日期 %s" % d.isoformat()
         if not pages:
@@ -386,6 +392,8 @@ def fetch(src, d, archive_root, with_text=False, max_articles=12):
     else:
         try:
             base, n = _probe_pages(src, d)
+        except lib.PIPELINE_FATAL_EXCEPTIONS:
+            raise
         except RuntimeError as exc:
             return None, str(exc)
         if not base:
@@ -404,6 +412,8 @@ def fetch(src, d, archive_root, with_text=False, max_articles=12):
     for u, no_ord, label, fallback_name in expected_pages:
         try:
             st, final_url, raw = lib.http_get(u, referer=src.get("entry"))
+        except lib.PIPELINE_FATAL_EXCEPTIONS:
+            raise
         except Exception as exc:  # noqa: BLE001
             return None, "第%s版访问异常：%s" % (no_ord, exc)
         if st != 200:
@@ -496,6 +506,8 @@ def fetch(src, d, archive_root, with_text=False, max_articles=12):
                     return None, "版面图候选 URL 日期与请求日期 %s 不一致" % d.isoformat()
                 try:
                     st2, image_final_url, b2 = lib.http_get(cand, referer=u)
+                except lib.PIPELINE_FATAL_EXCEPTIONS:
+                    raise
                 except Exception:  # noqa: BLE001
                     continue
                 if st2 != 200:
@@ -551,6 +563,8 @@ def fetch(src, d, archive_root, with_text=False, max_articles=12):
              "units": all_units, "fetched_at": datetime.datetime.now().isoformat(timespec="seconds")}
     try:
         lib.commit_issue_tree(aps["dir"], page_downloads, issue)
+    except lib.PIPELINE_FATAL_EXCEPTIONS:
+        raise
     except Exception as exc:  # noqa: BLE001
         return None, "整期归档事务失败：%s" % exc
     return issue, None
@@ -617,6 +631,8 @@ def parse(src, d, archive_root, max_articles=8):
                     return issue, "第%s版第%s篇文章%s" % (
                         unit_index, article_index, date_error
                     )
+            except lib.PIPELINE_FATAL_EXCEPTIONS:
+                raise
             except Exception as exc:  # noqa: BLE001
                 return issue, "第%s版第%s篇文章访问异常：%s" % (
                     unit_index, article_index, exc

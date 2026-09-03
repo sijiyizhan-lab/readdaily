@@ -3,7 +3,7 @@
 """readdaily —— 多报每日读报系统 CLI（GitHub 发行版公共入口）
 
 子命令：
-  fetch                      抓取当日（默认全部启用源）  --date/--source/--stage/--offline
+  fetch                      抓取当日（默认全部启用源）  --date/--source/--stage/--offline/--workers
   prepare / ingest / archive  归纳流水线（Agent 配合）
   digest                     当日摘要汇总（供撰写每日摘要）
   tracking --entity 城市地下管网  主体档案追加
@@ -52,6 +52,8 @@ def cmd_fetch(args):
         cmd += ["--stage", args.stage]
     if args.offline:
         cmd += ["--offline"]
+    if getattr(args, "workers", None) is not None:
+        cmd += ["--workers", str(args.workers)]
     return subprocess.run(cmd).returncode
 
 
@@ -134,6 +136,10 @@ def main():
     ap.add_argument("--source", default=None, help="源 id（逗号分隔）")
     ap.add_argument("--stage", default=None, help="fetched,parsed")
     ap.add_argument("--offline", action="store_true")
+    ap.add_argument(
+        "--workers", type=int, choices=range(1, 9), default=None,
+        metavar="N", help="fetch 跨报纸并发数（默认 4）",
+    )
     ap.add_argument("--entity", default=None, help="tracking 主体")
     ap.add_argument("--keyword", default=None, help="query 关键词")
     ap.add_argument("--days", type=int, default=2, help="query 回溯天数")

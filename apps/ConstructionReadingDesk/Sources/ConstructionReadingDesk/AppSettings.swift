@@ -143,7 +143,7 @@ struct SettingsPane: View {
                 }
                 .keyboardShortcut(.defaultAction)
                 .controlSize(.large)
-                .disabled(draft == settings.values || viewModel.isBusy)
+                .disabled(draft == settings.values || viewModel.isEditorialBusy)
             }
         }
         .formStyle(.grouped)

@@ -3,6 +3,7 @@
 """newspaper-fetch 公共库：HTTP/状态机/校验/日志/路径。"""
 import datetime
 import contextlib
+import errno
 import glob
 import hashlib
 from html.parser import HTMLParser
@@ -46,30 +47,102 @@ def html_tag_attributes(document, tag_name):
     try:
         collector.feed(document)
         collector.close()
+    except MemoryError:
+        raise
     except Exception:  # noqa: BLE001
         return []
     return collector.rows
 
+_HTTP_CONTEXT = threading.local()
+
+
+def close_http_client():
+    """Release the current thread's client at a newspaper boundary.
+
+    A worker thread may execute more than one newspaper sequentially.  The
+    connection pool is deliberately reused during one source's fetch/parse
+    transaction, then discarded so cookies and authentication state cannot
+    leak into the next source scheduled on that worker.
+    """
+    client = getattr(_HTTP_CONTEXT, "client", None)
+    if client is None:
+        return
+    try:
+        delattr(_HTTP_CONTEXT, "client")
+    except AttributeError:  # pragma: no cover - defensive thread-local race
+        pass
+    close = getattr(client, "close", None)
+    if callable(close):
+        try:
+            close()
+        except MemoryError:
+            raise
+        except Exception:  # noqa: BLE001 - cleanup must not mask source result
+            pass
+
 try:
     import requests
-    _S = requests.Session()
-    _S.headers["User-Agent"] = UA
+
+    def _http_client():
+        """Return one connection pool per worker thread.
+
+        ``requests.Session`` owns mutable cookies and connection-pool state.
+        Sharing one instance across the bounded source executor made unrelated
+        newspaper requests contend on (and mutate) the same client.  A
+        thread-local session preserves keep-alive while preventing concurrently
+        running sources from sharing mutable transport state.
+        """
+        client = getattr(_HTTP_CONTEXT, "client", None)
+        if client is None:
+            client = requests.Session()
+            client.headers["User-Agent"] = UA
+            _HTTP_CONTEXT.client = client
+        return client
 
     def http_get(url, referer=None, timeout=30, cookies=None):
         h = {"Referer": referer} if referer else {}
-        r = _S.get(url, headers=h, timeout=timeout, cookies=cookies)
+        r = _http_client().get(
+            url, headers=h, timeout=timeout, cookies=cookies
+        )
+        return r.status_code, r.url, r.content
+
+    def http_post_json(url, data, headers=None, timeout=30):
+        r = _http_client().post(
+            url, json=data, headers=dict(headers or {}), timeout=timeout
+        )
         return r.status_code, r.url, r.content
 except ImportError:  # pragma: no cover
     import http.cookiejar
     import urllib.request
-    _CJ = http.cookiejar.CookieJar()
-    _OP = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(_CJ))
-    _OP.addheaders = [("User-Agent", UA)]
+
+    def _http_client():
+        """Return one cookie-aware stdlib opener per worker thread."""
+        client = getattr(_HTTP_CONTEXT, "client", None)
+        if client is None:
+            cookie_jar = http.cookiejar.CookieJar()
+            client = urllib.request.build_opener(
+                urllib.request.HTTPCookieProcessor(cookie_jar)
+            )
+            client.addheaders = [("User-Agent", UA)]
+            _HTTP_CONTEXT.client = client
+        return client
 
     def http_get(url, referer=None, timeout=30, cookies=None):
         h = {"Referer": referer} if referer else {}
         req = urllib.request.Request(url, headers=h)
-        with _OP.open(req, timeout=timeout) as resp:
+        with _http_client().open(req, timeout=timeout) as resp:
+            return resp.status, resp.geturl(), resp.read()
+
+    def http_post_json(url, data, headers=None, timeout=30):
+        request_headers = {"Content-Type": "application/json"}
+        request_headers.update(dict(headers or {}))
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(data, ensure_ascii=False).encode("utf-8"),
+            headers=request_headers,
+            method="POST",
+        )
+        with _http_client().open(req, timeout=timeout) as resp:
             return resp.status, resp.geturl(), resp.read()
 
 
@@ -486,6 +559,8 @@ def image_validation_error(
 
 
 def norm_day(d):
+    if isinstance(d, datetime.datetime):
+        return d.date()
     if isinstance(d, datetime.date):
         return d
     return datetime.datetime.strptime(str(d), "%Y-%m-%d").date()
@@ -525,8 +600,139 @@ class ArchiveConflictError(RuntimeError):
     """An opened archive or one of its ancestors changed during an operation."""
 
 
+class ArchiveTransactionError(RuntimeError):
+    """An archive commit/rollback/cleanup could not finish durably."""
+
+
+ARCHIVE_FATAL_EXCEPTIONS = (
+    ArchivePathSafetyError,
+    ArchiveConflictError,
+    ArchiveTransactionError,
+)
+PIPELINE_FATAL_EXCEPTIONS = ARCHIVE_FATAL_EXCEPTIONS + (MemoryError,)
+
+
+def open_lock_file_at(directory_fd, name, mode=0o600):
+    """Create or open one lock file without following links.
+
+    macOS can return ``ENOENT`` when two processes concurrently call
+    ``open(O_CREAT | O_NOFOLLOW)`` for the same previously-missing entry.
+    An exclusive create followed by a no-follow open avoids that kernel race
+    while retaining the fail-closed symlink boundary.
+    """
+    flags = os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    for _attempt in range(8):
+        try:
+            return os.open(
+                name, flags | os.O_CREAT | os.O_EXCL, mode,
+                dir_fd=directory_fd,
+            )
+        except FileExistsError:
+            try:
+                return os.open(name, flags, dir_fd=directory_fd)
+            except FileNotFoundError:
+                # The entry changed between the create and open attempts.
+                # Retry a bounded number of times, then let the caller map the
+                # unstable path to its typed fatal lock error.
+                continue
+    raise FileNotFoundError(
+        errno.ENOENT, "锁文件在创建期间反复变化", name
+    )
+
+
+def _combined_archive_cleanup_error(message, primary_error, cleanup_error):
+    """Keep archive cleanup failures fatal without losing the first failure."""
+    error = ArchiveTransactionError(message)
+    error.primary_error = primary_error
+    error.cleanup_error = cleanup_error
+    return error
+
+
+def _cleanup_archive_temporary(
+        parent_fd, parent_display, name, *, descriptor=-1,
+        directory=False, description="归档暂存项"):
+    """Remove one temporary entry and durably record its removal.
+
+    Callers invoke this from ``finally`` blocks.  Every ordinary cleanup I/O
+    error is converted to the archive-fatal transaction type so it cannot
+    replace an earlier safety conflict and later be treated as a source miss.
+    """
+    first_error = None
+    if descriptor >= 0:
+        try:
+            os.close(descriptor)
+        except Exception as exc:  # noqa: BLE001 - normalized below
+            first_error = exc
+    removed = False
+    try:
+        if directory:
+            os.rmdir(name, dir_fd=parent_fd)
+        else:
+            os.unlink(name, dir_fd=parent_fd)
+        removed = True
+    except FileNotFoundError:
+        pass
+    except Exception as exc:  # noqa: BLE001 - normalized below
+        if first_error is None:
+            first_error = exc
+    if removed:
+        try:
+            with _pinned_directory(parent_display, parent_fd):
+                fsync_directory(parent_display)
+        except Exception as exc:  # noqa: BLE001 - normalized below
+            if first_error is None:
+                first_error = exc
+    if first_error is not None:
+        if isinstance(first_error, ARCHIVE_FATAL_EXCEPTIONS):
+            raise first_error
+        raise ArchiveTransactionError(
+            "%s未完成耐久清理" % description
+        ) from first_error
+
+
+def _close_archive_descriptor(
+        descriptor, description, primary_error=None):
+    """Close an archive fd without allowing raw cleanup I/O to mask safety."""
+    try:
+        os.close(descriptor)
+    except Exception as cleanup_error:  # noqa: BLE001 - normalized below
+        if primary_error is not None:
+            raise _combined_archive_cleanup_error(
+                "%s失败，且文件描述符清理未完成" % description,
+                primary_error,
+                cleanup_error,
+            ) from primary_error
+        if isinstance(cleanup_error, ARCHIVE_FATAL_EXCEPTIONS):
+            raise
+        raise ArchiveTransactionError(
+            "%s文件描述符清理未完成" % description
+        ) from cleanup_error
+
+
 _ARCHIVE_CONTEXT = threading.local()
 _PINNED_DIRECTORY_CONTEXT = threading.local()
+_LOG_THREAD_LOCKS = {}
+_LOG_THREAD_LOCKS_GUARD = threading.Lock()
+_CONSOLE_PRINT_LOCK = threading.RLock()
+_SYSTEM_TEMP_ROOT = "/private/tmp" if sys.platform == "darwin" else "/tmp"
+READDAILY_USER_LOCK_ROOT = os.path.join(
+    _SYSTEM_TEMP_ROOT, "readdaily-%s" % os.geteuid()
+)
+READDAILY_LOCK_ROOT = os.path.join(
+    READDAILY_USER_LOCK_ROOT, "locks"
+)
+SOURCE_EVIDENCE_LOCK_ROOT = os.path.join(
+    READDAILY_LOCK_ROOT, "source-evidence"
+)
+FETCH_BATCH_LOCK_ROOT = os.path.join(READDAILY_LOCK_ROOT, "fetch-batches")
+
+
+def console_print(*values, **kwargs):
+    """Emit one complete console record across concurrent source workers."""
+    with _CONSOLE_PRINT_LOCK:
+        print(*values, **kwargs)
 
 
 def _absolute_path(path):
@@ -556,6 +762,35 @@ def _directory_open_flags():
 
 def _same_inode(first, second):
     return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
+
+
+def _open_verified_at(parent_fd, name, flags, before, description):
+    """Open a previously-lstat'd entry and prove its identity did not change."""
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent_fd)
+    except OSError as exc:
+        raise ArchiveConflictError(
+            "%s在安全打开时被移走或替换" % description
+        ) from exc
+    try:
+        opened = os.fstat(descriptor)
+    except OSError as exc:
+        primary_error = ArchiveConflictError(
+            "%s在校验打开身份时失效" % description
+        )
+        _close_archive_descriptor(
+            descriptor, description, primary_error=primary_error
+        )
+        raise primary_error from exc
+    if not _same_inode(before, opened):
+        primary_error = ArchiveConflictError(
+            "%s在打开时发生变化" % description
+        )
+        _close_archive_descriptor(
+            descriptor, description, primary_error=primary_error
+        )
+        raise primary_error
+    return descriptor
 
 
 @contextlib.contextmanager
@@ -618,23 +853,35 @@ class ArchiveSession:
                 except FileNotFoundError:
                     if not create:
                         raise
-                    os.mkdir(name, mode, dir_fd=parent_fd)
                     created_display = os.path.join(current, name)
-                    self.created_paths.append(created_display)
-                    with _pinned_directory(parent_display, parent_fd):
-                        fsync_directory(parent_display)
-                    before = os.stat(
-                        name, dir_fd=parent_fd, follow_symlinks=False
-                    )
+                    try:
+                        os.mkdir(name, mode, dir_fd=parent_fd)
+                    except FileExistsError:
+                        # Another ArchiveSession may have created the shared
+                        # component after our lstat.  Treat that only as a
+                        # creation race: the lstat/open/inode checks below must
+                        # still prove it is the same real directory.
+                        pass
+                    else:
+                        self.created_paths.append(created_display)
+                        with _pinned_directory(parent_display, parent_fd):
+                            fsync_directory(parent_display)
+                    try:
+                        before = os.stat(
+                            name, dir_fd=parent_fd, follow_symlinks=False
+                        )
+                    except FileNotFoundError as exc:
+                        raise ArchiveConflictError(
+                            "归档目录在并发创建时被移走"
+                        ) from exc
                 if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
                     raise ArchivePathSafetyError(
                         "归档目录链包含符号链接或非目录项：%s" %
                         os.path.join(current, name)
                     )
-                child = os.open(name, flags, dir_fd=parent_fd)
-                if not _same_inode(before, os.fstat(child)):
-                    os.close(child)
-                    raise ArchiveConflictError("归档目录在创建时发生变化")
+                child = _open_verified_at(
+                    parent_fd, name, flags, before, "归档目录"
+                )
                 self._root_chain.append((parent_fd, name, child))
                 descriptor = child
                 opened.append(descriptor)
@@ -674,6 +921,46 @@ class ArchiveSession:
                 pass
         self._root_fd = None
         self._root_chain = []
+
+    def fork(self):
+        """Duplicate this pinned session for use in another thread.
+
+        File-descriptor duplication preserves the exact directory inode chosen
+        by the coordinator.  Reopening ``configured_root`` in a worker would
+        instead allow a rename-and-replace race to redirect that worker into a
+        different, but otherwise valid, directory.
+        """
+        self.assert_stable()
+        duplicated = {}
+        try:
+            originals = []
+            for parent_fd, _name, child_fd in self._root_chain:
+                originals.extend((parent_fd, child_fd))
+            originals.append(self._root_fd)
+            for descriptor in originals:
+                if descriptor not in duplicated:
+                    duplicated[descriptor] = os.dup(descriptor)
+
+            clone = object.__new__(ArchiveSession)
+            clone.configured_root = self.configured_root
+            clone.canonical_root = self.canonical_root
+            clone._root_fd = duplicated[self._root_fd]
+            clone._root_chain = [
+                (duplicated[parent_fd], name, duplicated[child_fd])
+                for parent_fd, name, child_fd in self._root_chain
+            ]
+            clone.created_paths = []
+            clone._closed = False
+            self.assert_stable()
+            clone.assert_stable()
+            return clone
+        except BaseException:
+            for descriptor in duplicated.values():
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            raise
 
     def assert_stable(self):
         if self._closed or self._root_fd is None:
@@ -738,24 +1025,38 @@ class ArchiveSession:
                 except FileNotFoundError:
                     if not create:
                         raise
-                    os.mkdir(name, mode, dir_fd=parent_fd)
-                    display = os.path.join(display, name)
-                    self.created_paths.append(display)
-                    with _pinned_directory(parent_display, parent_fd):
-                        fsync_directory(parent_display)
-                    before = os.stat(
-                        name, dir_fd=parent_fd, follow_symlinks=False
-                    )
+                    child_display = os.path.join(display, name)
+                    try:
+                        os.mkdir(name, mode, dir_fd=parent_fd)
+                    except FileExistsError:
+                        # A peer may win the missing -> mkdir race for shared
+                        # parents such as ``_state``.  Never trust the errno:
+                        # lstat without following links, open with O_NOFOLLOW,
+                        # then compare the two inode identities below.
+                        pass
+                    else:
+                        self.created_paths.append(child_display)
+                        with _pinned_directory(parent_display, parent_fd):
+                            fsync_directory(parent_display)
+                    try:
+                        before = os.stat(
+                            name, dir_fd=parent_fd, follow_symlinks=False
+                        )
+                    except FileNotFoundError as exc:
+                        raise ArchiveConflictError(
+                            "归档子目录在并发创建时被移走"
+                        ) from exc
+                    display = child_display
                 else:
                     display = os.path.join(display, name)
                 if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
                     raise ArchivePathSafetyError(
                         "归档目录链包含符号链接或非目录项：%s" % display
                     )
-                child = os.open(name, _directory_open_flags(), dir_fd=parent_fd)
-                if not _same_inode(before, os.fstat(child)):
-                    os.close(child)
-                    raise ArchiveConflictError("归档子目录在打开时发生变化")
+                child = _open_verified_at(
+                    parent_fd, name, _directory_open_flags(), before,
+                    "归档子目录",
+                )
                 chain.append((parent_fd, name, child))
                 descriptor = child
             self._assert_local_chain(chain)
@@ -834,14 +1135,34 @@ class ArchiveSession:
 
     def read_bytes(self, relative):
         with self.opened_parent(relative) as (parent_fd, _display, name, chain):
+            try:
+                linked = os.stat(
+                    name, dir_fd=parent_fd, follow_symlinks=False
+                )
+            except FileNotFoundError:
+                raise
+            except OSError as exc:
+                raise ArchivePathSafetyError(
+                    "归档读取目标无法安全检查"
+                ) from exc
+            if stat.S_ISLNK(linked.st_mode) or not stat.S_ISREG(linked.st_mode):
+                raise ArchivePathSafetyError("归档读取目标必须是真实普通文件")
             flags = os.O_RDONLY
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
-            descriptor = os.open(name, flags, dir_fd=parent_fd)
+            try:
+                descriptor = os.open(name, flags, dir_fd=parent_fd)
+            except FileNotFoundError as exc:
+                raise ArchiveConflictError("归档读取目标在打开前被移走") from exc
+            except OSError as exc:
+                raise ArchivePathSafetyError(
+                    "归档读取目标无法安全打开"
+                ) from exc
             try:
                 before = os.fstat(descriptor)
-                if not stat.S_ISREG(before.st_mode):
-                    raise ArchivePathSafetyError("归档读取目标必须是普通文件")
+                if (not stat.S_ISREG(before.st_mode)
+                        or not _same_inode(linked, before)):
+                    raise ArchiveConflictError("归档读取目标身份发生变化")
                 with os.fdopen(descriptor, "rb", closefd=False) as stream:
                     payload = stream.read()
                 after = os.fstat(descriptor)
@@ -853,7 +1174,11 @@ class ArchiveSession:
                 self.assert_stable()
                 return payload
             finally:
-                os.close(descriptor)
+                _close_archive_descriptor(
+                    descriptor,
+                    "归档读取",
+                    primary_error=sys.exc_info()[1],
+                )
 
     def atomic_write(self, relative, payload, mode=0o600):
         if not isinstance(payload, (bytes, bytearray, memoryview)):
@@ -864,7 +1189,14 @@ class ArchiveSession:
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
-            descriptor = os.open(temporary, flags, mode, dir_fd=parent_fd)
+            try:
+                descriptor = os.open(
+                    temporary, flags, mode, dir_fd=parent_fd
+                )
+            except OSError as exc:
+                raise ArchiveTransactionError(
+                    "无法安全创建归档原子写入暂存文件"
+                ) from exc
             temporary_exists = True
             try:
                 with os.fdopen(descriptor, "wb") as stream:
@@ -883,40 +1215,120 @@ class ArchiveSession:
                     fsync_directory(parent_display)
                 self._assert_local_chain(chain)
                 self.assert_stable()
+            except ARCHIVE_FATAL_EXCEPTIONS:
+                raise
+            except OSError as exc:
+                raise ArchiveTransactionError(
+                    "归档原子写入未完成耐久提交"
+                ) from exc
             finally:
-                if descriptor >= 0:
-                    os.close(descriptor)
-                if temporary_exists:
+                primary_error = sys.exc_info()[1]
+                if descriptor >= 0 or temporary_exists:
                     try:
-                        os.unlink(temporary, dir_fd=parent_fd)
-                    except FileNotFoundError:
-                        pass
-                    else:
-                        with _pinned_directory(parent_display, parent_fd):
-                            fsync_directory(parent_display)
+                        _cleanup_archive_temporary(
+                            parent_fd,
+                            parent_display,
+                            temporary,
+                            descriptor=descriptor,
+                            description="归档原子写入暂存文件",
+                        )
+                    except Exception as cleanup_error:  # noqa: BLE001
+                        if primary_error is None:
+                            raise
+                        raise _combined_archive_cleanup_error(
+                            "归档原子写入失败，且暂存文件清理未完成",
+                            primary_error,
+                            cleanup_error,
+                        ) from primary_error
 
     def append_bytes(self, relative, payload):
         with self.opened_parent(relative, create=True) as (
                 parent_fd, parent_display, name, chain):
-            flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+            flags = os.O_WRONLY | os.O_APPEND
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
-            descriptor = os.open(name, flags, 0o600, dir_fd=parent_fd)
             try:
-                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                linked = os.stat(
+                    name, dir_fd=parent_fd, follow_symlinks=False
+                )
+            except FileNotFoundError:
+                linked = None
+            except OSError as exc:
+                raise ArchivePathSafetyError(
+                    "追加日志目标无法安全检查"
+                ) from exc
+            if linked is not None:
+                if (stat.S_ISLNK(linked.st_mode)
+                        or not stat.S_ISREG(linked.st_mode)):
+                    raise ArchivePathSafetyError(
+                        "追加日志目标必须是真实普通文件"
+                    )
+                descriptor = _open_verified_at(
+                    parent_fd, name, flags, linked, "追加日志目标"
+                )
+            else:
+                try:
+                    descriptor = os.open(
+                        name, flags | os.O_CREAT | os.O_EXCL, 0o600,
+                        dir_fd=parent_fd,
+                    )
+                except FileExistsError:
+                    try:
+                        linked = os.stat(
+                            name, dir_fd=parent_fd, follow_symlinks=False
+                        )
+                    except OSError as exc:
+                        raise ArchiveConflictError(
+                            "追加日志目标在并发创建时失效"
+                        ) from exc
+                    if (stat.S_ISLNK(linked.st_mode)
+                            or not stat.S_ISREG(linked.st_mode)):
+                        raise ArchivePathSafetyError(
+                            "追加日志目标必须是真实普通文件"
+                        )
+                    descriptor = _open_verified_at(
+                        parent_fd, name, flags, linked, "追加日志目标"
+                    )
+                except OSError as exc:
+                    raise ArchivePathSafetyError(
+                        "追加日志目标无法安全创建"
+                    ) from exc
+            try:
+                opened = os.fstat(descriptor)
+                if not stat.S_ISREG(opened.st_mode):
                     raise ArchivePathSafetyError("追加日志目标必须是普通文件")
-                with os.fdopen(descriptor, "ab") as stream:
-                    descriptor = -1
+                with os.fdopen(descriptor, "ab", closefd=False) as stream:
                     stream.write(bytes(payload))
                     stream.flush()
                     os.fsync(stream.fileno())
+                try:
+                    linked_after = os.stat(
+                        name, dir_fd=parent_fd, follow_symlinks=False
+                    )
+                except OSError as exc:
+                    raise ArchiveConflictError(
+                        "追加日志目标在写入期间被移走"
+                    ) from exc
+                if not _same_inode(opened, linked_after):
+                    raise ArchiveConflictError(
+                        "追加日志目标在写入期间发生变化"
+                    )
                 with _pinned_directory(parent_display, parent_fd):
                     fsync_directory(parent_display)
                 self._assert_local_chain(chain)
                 self.assert_stable()
+            except ARCHIVE_FATAL_EXCEPTIONS:
+                raise
+            except OSError as exc:
+                raise ArchiveTransactionError(
+                    "追加日志未完成耐久写入"
+                ) from exc
             finally:
-                if descriptor >= 0:
-                    os.close(descriptor)
+                _close_archive_descriptor(
+                    descriptor,
+                    "归档日志追加",
+                    primary_error=sys.exc_info()[1],
+                )
 
     def make_temp_dir(self, parent_relative=".", prefix=".staging."):
         with self.opened_dir(parent_relative, create=True) as (
@@ -927,17 +1339,32 @@ class ArchiveSession:
                     os.mkdir(name, 0o700, dir_fd=parent_fd)
                 except FileExistsError:
                     continue
+                except OSError as exc:
+                    raise ArchiveTransactionError(
+                        "无法安全创建归档暂存目录"
+                    ) from exc
                 try:
                     with _pinned_directory(parent_display, parent_fd):
                         fsync_directory(parent_display)
-                except BaseException:
+                except BaseException as primary_error:
                     try:
-                        os.rmdir(name, dir_fd=parent_fd)
-                    except OSError:
-                        pass
-                    else:
-                        with _pinned_directory(parent_display, parent_fd):
-                            fsync_directory(parent_display)
+                        _cleanup_archive_temporary(
+                            parent_fd,
+                            parent_display,
+                            name,
+                            directory=True,
+                            description="归档暂存目录",
+                        )
+                    except Exception as cleanup_error:  # noqa: BLE001
+                        raise _combined_archive_cleanup_error(
+                            "归档暂存目录创建失败，且耐久清理未完成",
+                            primary_error,
+                            cleanup_error,
+                        ) from primary_error
+                    if isinstance(primary_error, OSError):
+                        raise ArchiveTransactionError(
+                            "归档暂存目录创建未完成耐久提交"
+                        ) from primary_error
                     raise
                 self._assert_local_chain(chain)
                 self.assert_stable()
@@ -995,10 +1422,11 @@ class ArchiveSession:
         before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
             raise ArchivePathSafetyError("递归删除目标必须是真实目录")
-        descriptor = os.open(name, _directory_open_flags(), dir_fd=parent_fd)
+        descriptor = _open_verified_at(
+            parent_fd, name, _directory_open_flags(), before,
+            "待删除目录",
+        )
         try:
-            if not _same_inode(before, os.fstat(descriptor)):
-                raise ArchiveConflictError("待删除目录在打开时发生变化")
             for child in os.listdir(descriptor):
                 info = os.stat(child, dir_fd=descriptor, follow_symlinks=False)
                 if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
@@ -1007,7 +1435,11 @@ class ArchiveSession:
                     os.unlink(child, dir_fd=descriptor)
             os.fsync(descriptor)
         finally:
-            os.close(descriptor)
+            _close_archive_descriptor(
+                descriptor,
+                "递归删除归档目录",
+                primary_error=sys.exc_info()[1],
+            )
         current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         if not _same_inode(before, current):
             raise ArchiveConflictError("待删除目录身份发生变化")
@@ -1035,24 +1467,33 @@ class ArchiveSession:
             if stat.S_ISLNK(before.st_mode):
                 raise ArchivePathSafetyError("待提交目录树不能包含符号链接")
             if stat.S_ISDIR(before.st_mode):
-                child = os.open(name, _directory_open_flags(), dir_fd=descriptor)
+                child = _open_verified_at(
+                    descriptor, name, _directory_open_flags(), before,
+                    "待提交目录",
+                )
                 try:
-                    if not _same_inode(before, os.fstat(child)):
-                        raise ArchiveConflictError("待提交目录在打开时发生变化")
                     cls._fsync_tree_fd(child)
                 finally:
-                    os.close(child)
+                    _close_archive_descriptor(
+                        child,
+                        "归档目录树耐久提交",
+                        primary_error=sys.exc_info()[1],
+                    )
             elif stat.S_ISREG(before.st_mode):
                 flags = os.O_RDONLY
                 if hasattr(os, "O_NOFOLLOW"):
                     flags |= os.O_NOFOLLOW
-                child = os.open(name, flags, dir_fd=descriptor)
+                child = _open_verified_at(
+                    descriptor, name, flags, before, "待提交文件"
+                )
                 try:
-                    if not _same_inode(before, os.fstat(child)):
-                        raise ArchiveConflictError("待提交文件在打开时发生变化")
                     os.fsync(child)
                 finally:
-                    os.close(child)
+                    _close_archive_descriptor(
+                        child,
+                        "归档文件耐久提交",
+                        primary_error=sys.exc_info()[1],
+                    )
             else:
                 raise ArchivePathSafetyError("目录树只能包含真实普通文件")
         os.fsync(descriptor)
@@ -1072,22 +1513,27 @@ class ArchiveSession:
                 raise ArchivePathSafetyError("归档目录树不能包含符号链接")
             if stat.S_ISDIR(before.st_mode):
                 directories.append(relative)
-                child = os.open(name, _directory_open_flags(), dir_fd=descriptor)
+                child = _open_verified_at(
+                    descriptor, name, _directory_open_flags(), before,
+                    "归档目录",
+                )
                 try:
-                    if not _same_inode(before, os.fstat(child)):
-                        raise ArchiveConflictError("归档目录在读取时发生变化")
                     cls._snapshot_tree_fd(child, relative, directories, files)
                 finally:
-                    os.close(child)
+                    _close_archive_descriptor(
+                        child,
+                        "归档目录快照",
+                        primary_error=sys.exc_info()[1],
+                    )
             elif stat.S_ISREG(before.st_mode):
                 flags = os.O_RDONLY
                 if hasattr(os, "O_NOFOLLOW"):
                     flags |= os.O_NOFOLLOW
-                child = os.open(name, flags, dir_fd=descriptor)
+                child = _open_verified_at(
+                    descriptor, name, flags, before, "归档文件"
+                )
                 try:
                     opened = os.fstat(child)
-                    if not _same_inode(before, opened):
-                        raise ArchiveConflictError("归档文件在读取时发生变化")
                     with os.fdopen(child, "rb", closefd=False) as stream:
                         payload = stream.read()
                     after = os.fstat(child)
@@ -1097,7 +1543,11 @@ class ArchiveSession:
                         raise ArchiveConflictError("归档文件在读取期间发生变化")
                     files.append((relative, payload))
                 finally:
-                    os.close(child)
+                    _close_archive_descriptor(
+                        child,
+                        "归档文件快照",
+                        primary_error=sys.exc_info()[1],
+                    )
             else:
                 raise ArchivePathSafetyError("归档目录树包含特殊文件")
 
@@ -1116,7 +1566,14 @@ class ArchiveSession:
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
-            descriptor = os.open(temporary, flags, 0o600, dir_fd=parent_fd)
+            try:
+                descriptor = os.open(
+                    temporary, flags, 0o600, dir_fd=parent_fd
+                )
+            except OSError as exc:
+                raise ArchiveTransactionError(
+                    "无法安全创建归档复制暂存文件"
+                ) from exc
             temporary_exists = True
             digest = hashlib.sha256()
             try:
@@ -1146,17 +1603,31 @@ class ArchiveSession:
                 self._assert_local_chain(chain)
                 self.assert_stable()
                 return actual
+            except ARCHIVE_FATAL_EXCEPTIONS:
+                raise
+            except OSError as exc:
+                raise ArchiveTransactionError(
+                    "归档文件复制未完成耐久提交"
+                ) from exc
             finally:
-                if descriptor >= 0:
-                    os.close(descriptor)
-                if temporary_exists:
+                primary_error = sys.exc_info()[1]
+                if descriptor >= 0 or temporary_exists:
                     try:
-                        os.unlink(temporary, dir_fd=parent_fd)
-                    except FileNotFoundError:
-                        pass
-                    else:
-                        with _pinned_directory(parent_display, parent_fd):
-                            fsync_directory(parent_display)
+                        _cleanup_archive_temporary(
+                            parent_fd,
+                            parent_display,
+                            temporary,
+                            descriptor=descriptor,
+                            description="归档复制暂存文件",
+                        )
+                    except Exception as cleanup_error:  # noqa: BLE001
+                        if primary_error is None:
+                            raise
+                        raise _combined_archive_cleanup_error(
+                            "归档文件复制失败，且暂存文件清理未完成",
+                            primary_error,
+                            cleanup_error,
+                        ) from primary_error
 
 
 def _archive_stack():
@@ -1172,6 +1643,100 @@ def current_archive_session(path=None):
         if path is None or session.relative_path(path) is not None:
             return session
     return None
+
+
+def archive_lock_identity(root):
+    """Return a source-lock identity tied to the opened archive inode.
+
+    Path strings are not identities on a case-insensitive filesystem.  If the
+    archive exists, pin its full component chain and derive the key from the
+    root descriptor.  A path identity is used only for a genuinely not-yet-
+    created archive.  Callers must create and pin it before acquiring a source
+    lock so a missing-path key can never transition to a different inode key.
+    """
+    configured = _absolute_path(root)
+    active = current_archive_session()
+    owns_session = False
+    if (active is None
+            or configured not in (
+                active.configured_root, active.canonical_root
+            )):
+        active = ArchiveSession(configured, create=False)
+        owns_session = True
+    try:
+        active.assert_stable()
+        info = os.fstat(active._root_fd)
+        if not stat.S_ISDIR(info.st_mode):
+            raise ArchivePathSafetyError("归档锁根路径必须是真实目录")
+        return "inode:%s:%s" % (info.st_dev, info.st_ino)
+    finally:
+        if owns_session:
+            active.close()
+
+
+@contextlib.contextmanager
+def fork_archive_session(parent):
+    """Bind an fd-cloned parent ArchiveSession to the current worker thread."""
+    if not isinstance(parent, ArchiveSession):
+        raise TypeError("工作线程归档会话必须来自 ArchiveSession")
+    if current_archive_session() is not None:
+        raise ArchiveConflictError("工作线程不能嵌套另一归档会话")
+    session = parent.fork()
+    stack = _archive_stack()
+    stack.append(session)
+    try:
+        yield session
+        session.assert_stable()
+    finally:
+        stack.pop()
+        session.close()
+
+
+@contextlib.contextmanager
+def pinned_user_lock_directory(path, label):
+    """Yield a securely pinned, TMPDIR-independent per-user lock directory."""
+    root = _absolute_path(path)
+    user_root = _absolute_path(READDAILY_USER_LOCK_ROOT)
+    try:
+        if os.path.commonpath([user_root, root]) != user_root:
+            raise ArchivePathSafetyError(
+                "%s必须位于固定的当前用户锁根目录" % label
+            )
+    except ValueError as exc:
+        raise ArchivePathSafetyError(
+            "%s无法绑定到固定的当前用户锁根目录" % label
+        ) from exc
+    with archive_session(root, create=True, mode=0o700) as session:
+        session.assert_stable()
+        configured_parts = [
+            part for part in session.configured_root.split(os.sep) if part
+        ]
+        user_parts = [part for part in user_root.split(os.sep) if part]
+        if configured_parts[:len(user_parts)] != user_parts:
+            raise ArchivePathSafetyError("%s固定根目录身份不一致" % label)
+        # /private/tmp is sticky and system-owned.  Starting with the
+        # predictable readdaily-<uid> component, every ancestor that could
+        # rename a descendant must itself belong exclusively to this user.
+        for _parent_fd, _name, child_fd in session._root_chain[
+                len(user_parts) - 1:]:
+            info = os.fstat(child_fd)
+            if (not stat.S_ISDIR(info.st_mode)
+                    or info.st_uid != os.geteuid()
+                    or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+                raise ArchivePathSafetyError(
+                    "%s及其用户级祖先必须由当前用户持有且不可被他人写入"
+                    % label
+                )
+        yield session._root_fd, root
+        session.assert_stable()
+
+
+@contextlib.contextmanager
+def source_evidence_lock_directory():
+    """Yield the stable source/date evidence lock directory."""
+    with pinned_user_lock_directory(
+            SOURCE_EVIDENCE_LOCK_ROOT, "报纸来源证据锁目录") as opened:
+        yield opened
 
 
 def assert_configured_roots_separate(first, second, label="Vault"):
@@ -1274,7 +1839,7 @@ def _session_for_single_path(path, create_parent=False):
 def load_json(path, default=None):
     try:
         return json.loads(read_bytes(path).decode("utf-8"))
-    except Exception:  # noqa: BLE001
+    except (FileNotFoundError, UnicodeError, json.JSONDecodeError):
         return default
 
 
@@ -1571,7 +2136,7 @@ def replace_issue_directory(staging, target):
                 except BaseException as exc:  # noqa: BLE001
                     recovery_errors.append(exc)
             if recovery_errors:
-                raise RuntimeError(
+                raise ArchiveTransactionError(
                     "期次提交失败且耐久回滚未完成；请保留并检查 target=%s、"
                     "staging=%s、backup=%s" % (target, staging, backup or "无")
                 ) from recovery_errors[0]
@@ -1581,7 +2146,7 @@ def replace_issue_directory(staging, target):
             try:
                 durable_rmtree(backup)
             except BaseException as cleanup_error:
-                raise RuntimeError(
+                raise ArchiveTransactionError(
                     "新期次已提交，但旧期次备份未完成耐久删除；"
                     "target=%s、backup=%s" % (target, backup)
                 ) from cleanup_error
@@ -1637,7 +2202,7 @@ def commit_issue_tree(issue_dir, files, issue):
                 try:
                     durable_rmtree(staging)
                 except BaseException as cleanup_error:
-                    raise RuntimeError(
+                    raise ArchiveTransactionError(
                         "期次事务未完成，且暂存目录未完成耐久清理：%s"
                         % staging
                     ) from cleanup_error
@@ -1677,10 +2242,19 @@ def chain_check(archive_root, source_id, d, issue_no):
 def log_line(path, entry):
     entry.setdefault("ts", datetime.datetime.now().isoformat(timespec="seconds"))
     payload = (json.dumps(entry, ensure_ascii=False) + "\n").encode("utf-8")
-    with _session_for_single_path(path, create_parent=True) as (
-            session, relative):
-        session.append_bytes(relative, payload)
-    print("[log]", json.dumps(entry, ensure_ascii=False)[:300])
+    lock_key = _absolute_path(path)
+    with _LOG_THREAD_LOCKS_GUARD:
+        thread_lock = _LOG_THREAD_LOCKS.setdefault(
+            lock_key, threading.Lock()
+        )
+    # A fetch batch now runs sources concurrently.  Serialize each complete
+    # JSON line so two worker threads can never splice their UTF-8 payloads.
+    # The date coordinator lock separately excludes another fetch process.
+    with thread_lock:
+        with _session_for_single_path(path, create_parent=True) as (
+                session, relative):
+            session.append_bytes(relative, payload)
+    console_print("[log]", json.dumps(entry, ensure_ascii=False)[:300])
 
 
 def safe_name(s):

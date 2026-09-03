@@ -90,7 +90,8 @@ class AtomicJSONTests(unittest.TestCase):
             with mock.patch.object(
                 lib, "fsync_directory", side_effect=OSError("flush failed")
             ):
-                with self.assertRaisesRegex(OSError, "flush failed"):
+                with self.assertRaisesRegex(
+                        lib.ArchiveTransactionError, "耐久提交"):
                     lib.durable_atomic_write_bytes(target, b"new-state")
 
             # The namespace mutation may already be visible, but the public

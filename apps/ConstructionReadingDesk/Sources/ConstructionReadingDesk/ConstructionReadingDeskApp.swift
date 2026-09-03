@@ -22,19 +22,21 @@ struct ConstructionReadingDeskApp: App {
             CommandGroup(after: .newItem) {
                 Button("添加 PDF…") { NotificationCenter.default.post(name: .readingDeskImportPDF, object: nil) }
                     .keyboardShortcut("o", modifiers: .command)
+                    .disabled(viewModel.isEditorialBusy)
                 Button("刷新读报台") { viewModel.refresh() }
                     .keyboardShortcut("r", modifiers: .command)
+                    .disabled(viewModel.isEditorialBusy)
                 Divider()
                 Button("保存整期草稿") { viewModel.saveDraft() }
                     .keyboardShortcut("s", modifiers: .command)
                     .disabled(
-                        viewModel.isBusy || viewModel.isIssueLoading
+                        viewModel.isEditorialBusy || viewModel.isIssueLoading
                             || viewModel.issueDetail == nil || !viewModel.hasUnsavedChanges
                     )
                 Button("预览发布") { viewModel.previewPublish() }
                     .keyboardShortcut("p", modifiers: [.command, .shift])
                     .disabled(
-                        viewModel.isBusy || viewModel.isIssueLoading
+                        viewModel.isEditorialBusy || viewModel.isIssueLoading
                             || !viewModel.canPublishSelectedIssue
                     )
             }

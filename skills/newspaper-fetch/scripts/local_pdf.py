@@ -70,39 +70,61 @@ def _validate_local_pdf_source(source: str) -> str:
 
 @contextlib.contextmanager
 def _issue_date_lock(archive_root: os.PathLike[str] | str, day: str):
-    """Share the fetch/publisher evidence lock for local issue mutation."""
-    normalized_day = dt.date.fromisoformat(str(day)).isoformat()
-    archive_identity = os.path.realpath(
-        os.path.abspath(os.path.expanduser(str(archive_root)))
-    )
-    archive_key = hashlib.sha256(archive_identity.encode("utf-8")).hexdigest()
-    lock_directory = os.path.join(
-        tempfile.gettempdir(), "readdaily-fetch-locks", archive_key
-    )
-    os.makedirs(lock_directory, mode=0o700, exist_ok=True)
-    if os.path.islink(lock_directory) or not os.path.isdir(lock_directory):
-        raise ValueError("报纸证据锁目录必须是真实目录")
-    lock_path = os.path.join(lock_directory, normalized_day + ".lock")
+    """Share the zgjsb source/date evidence lock for local issue mutation."""
+    if isinstance(day, dt.datetime):
+        normalized_day = day.date().isoformat()
+    elif isinstance(day, dt.date):
+        normalized_day = day.isoformat()
+    else:
+        normalized_day = dt.date.fromisoformat(str(day)).isoformat()
+    archive_identity = lib.archive_lock_identity(archive_root)
+    lock_key = hashlib.sha256((
+        archive_identity + "\0source-evidence\0"
+        + LOCAL_PDF_SOURCE + "\0" + normalized_day
+    ).encode("utf-8")).hexdigest()
+    lock_directory = lib._absolute_path(lib.SOURCE_EVIDENCE_LOCK_ROOT)
+    lock_path = os.path.join(lock_directory, lock_key + ".lock")
     thread_lock = _thread_lock_for_issue(archive_identity, normalized_day)
     with thread_lock:
-        flags = os.O_CREAT | os.O_RDWR
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        descriptor = os.open(lock_path, flags, 0o600)
-        locked = False
-        try:
-            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                raise ValueError("报纸证据锁不是可信普通文件")
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
-            locked = True
-            yield
-        finally:
-            if locked:
+        with lib.source_evidence_lock_directory() as (
+                lock_directory_fd, pinned_lock_directory):
+            if pinned_lock_directory != lock_directory:
+                raise lib.ArchivePathSafetyError(
+                    "报纸来源证据锁目录身份不一致"
+                )
+            try:
+                descriptor = lib.open_lock_file_at(
+                    lock_directory_fd, os.path.basename(lock_path), 0o600,
+                )
+            except OSError as exc:
+                raise lib.ArchivePathSafetyError(
+                    "报纸来源证据锁无法安全打开"
+                ) from exc
+            locked = False
+            try:
                 try:
-                    fcntl.flock(descriptor, fcntl.LOCK_UN)
-                except OSError:
-                    pass
-            os.close(descriptor)
+                    lock_info = os.fstat(descriptor)
+                    if (not stat.S_ISREG(lock_info.st_mode)
+                            or lock_info.st_uid != os.geteuid()
+                            or lock_info.st_mode
+                            & (stat.S_IWGRP | stat.S_IWOTH)):
+                        raise lib.ArchivePathSafetyError(
+                            "报纸来源证据锁必须是当前用户持有的可信普通文件"
+                        )
+                    fcntl.flock(descriptor, fcntl.LOCK_EX)
+                except OSError as exc:
+                    raise lib.ArchivePathSafetyError(
+                        "报纸来源证据锁操作失败"
+                    ) from exc
+                locked = True
+                yield
+            finally:
+                if locked:
+                    try:
+                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+                os.close(descriptor)
 
 
 def _load_json(path: Path, default=None):
@@ -269,6 +291,8 @@ def _copy_content_addressed(
         return target
     try:
         lib.durable_copy_file(source, target, expected_sha256=digest)
+    except lib.PIPELINE_FATAL_EXCEPTIONS:
+        raise
     except RuntimeError as exc:
         raise RuntimeError(
             "稳定 PDF 副本在内容寻址提交前发生变化，已拒绝导入"
@@ -795,7 +819,7 @@ def import_pdf(
     date: Optional[str] = None,
     vault_root: Optional[os.PathLike[str] | str] = None,
 ) -> Dict[str, Any]:
-    """Import under the same archive/date lock used by fetch and publish."""
+    """Import under the same source/date lock used by fetch and publish."""
     source = _validate_local_pdf_source(source)
     source_pdf = validate_pdf(pdf_path)
     filename_meta = parse_filename_metadata(source_pdf.name)
@@ -806,15 +830,18 @@ def import_pdf(
         chosen_date = dt.date.fromisoformat(str(chosen_date)).isoformat()
     except ValueError as exc:
         raise ValueError("日期必须为 YYYY-MM-DD") from exc
-    with _issue_date_lock(archive_root, chosen_date):
-        archive = Path(archive_root).expanduser().absolute()
-        selected_vault = (
-            vault_root or os.environ.get("READDAILY_VAULT") or DEFAULT_VAULT
-        )
-        lib.assert_configured_roots_separate(
-            archive, selected_vault, label="Vault"
-        )
-        with lib.archive_session(archive, create=True) as archive_handle:
+    archive = Path(archive_root).expanduser().absolute()
+    selected_vault = (
+        vault_root or os.environ.get("READDAILY_VAULT") or DEFAULT_VAULT
+    )
+    lib.assert_configured_roots_separate(
+        archive, selected_vault, label="Vault"
+    )
+    # Create and pin the archive before taking the source/date lock so every
+    # participant keys that lock from the same directory inode.  The pinned
+    # descriptor remains active for the complete import transaction.
+    with lib.archive_session(archive, create=True) as archive_handle:
+        with _issue_date_lock(archive, chosen_date):
             lib.assert_session_isolated(
                 archive_handle,
                 selected_vault,

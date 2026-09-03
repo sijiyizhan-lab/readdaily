@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""newspaper-fetch 编排器：注册表驱动，逐源逐期执行 fetched→parsed 两段状态。
+"""newspaper-fetch 编排器：注册表驱动，有界并发执行各源 fetched→parsed 事务。
 
 用法：
   python3 fetch.py --date 2026-09-02                 # 全部启用源
@@ -9,8 +9,10 @@
   python3 fetch.py --probe gmrb --date 2026-09-02    # 方正渠道模式探测
 """
 import argparse
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 import contextlib
 import datetime
+import errno
 import fcntl
 import hashlib
 import importlib
@@ -19,7 +21,6 @@ import os
 import shutil
 import stat
 import sys
-import tempfile
 import threading
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -43,6 +44,8 @@ ALLOWED_CHANNELS = frozenset({
 })
 _HELD_LOCKS = set()
 _HELD_LOCKS_GUARD = threading.Lock()
+_SOURCE_LOCKS = {}
+_SOURCE_LOCKS_GUARD = threading.Lock()
 STATE_SCHEMA_VERSION = 1
 PIPELINE_CONTRACT_VERSION = 1
 # Bump only the affected channel when its normalized fetch/parse contract
@@ -67,6 +70,20 @@ PARSER_CONTRACT_VERSIONS = {
 
 class FetchLockedError(RuntimeError):
     pass
+
+
+class FetchFatalError(RuntimeError):
+    """The archive transaction cannot safely continue with another source."""
+
+
+def _source_print(source, *values):
+    """Keep concurrent console lines atomic and attributable to one source."""
+    lib.console_print("  [%s]" % source, *values)
+
+
+def _source_header(source, name, day):
+    """Preserve the established human-readable source section marker."""
+    lib.console_print("\n=== [%s] %s %s ===" % (source, name, day))
 
 
 def validate_registry(registry):
@@ -245,57 +262,184 @@ def validate_registry_write_roots_outside_vault(registry, vault_root=None):
 
 @contextlib.contextmanager
 def fetch_date_lock(archive_root, day):
-    """Crash-recoverable exclusive lock scoped to one archive and issue date."""
+    """Prevent two complete fetch batches for one archive/date.
+
+    Source evidence has a separate, finer-grained lock below.  Keeping this
+    coordinator lock for the full batch preserves duplicate-run protection
+    while allowing the workbench to read a source that another worker is not
+    currently replacing.
+    """
     normalized_day = lib.norm_day(day).isoformat()
-    archive_identity = os.path.realpath(
-        os.path.abspath(os.path.expanduser(str(archive_root)))
-    )
+    archive_identity = lib.archive_lock_identity(archive_root)
     archive_key = hashlib.sha256(archive_identity.encode("utf-8")).hexdigest()
     lock_directory = os.path.join(
-        tempfile.gettempdir(), "readdaily-fetch-locks", archive_key
+        lib._absolute_path(lib.FETCH_BATCH_LOCK_ROOT), archive_key
     )
-    os.makedirs(lock_directory, mode=0o700, exist_ok=True)
     lock_path = os.path.join(lock_directory, normalized_day + ".lock")
-    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     held_key = (archive_key, normalized_day)
-    acquired = False
-    try:
-        with _HELD_LOCKS_GUARD:
-            if held_key in _HELD_LOCKS:
-                raise FetchLockedError(
-                    "同一归档与日期已有抓取任务运行：%s" % normalized_day
-                )
+    with lib.pinned_user_lock_directory(
+            lock_directory, "抓取批次锁目录") as (
+                lock_directory_fd, pinned_lock_directory):
+        if pinned_lock_directory != lock_directory:
+            raise lib.ArchivePathSafetyError("抓取批次锁目录身份不一致")
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except (BlockingIOError, OSError) as exc:
-            raise FetchLockedError(
-                "同一归档与日期已有抓取任务运行：%s" % normalized_day
+            descriptor = lib.open_lock_file_at(
+                lock_directory_fd, os.path.basename(lock_path), 0o600,
+            )
+        except OSError as exc:
+            raise lib.ArchivePathSafetyError(
+                "抓取批次锁无法安全打开"
             ) from exc
-        with _HELD_LOCKS_GUARD:
-            if held_key in _HELD_LOCKS:
+        acquired = False
+        try:
+            try:
+                lock_info = os.fstat(descriptor)
+            except OSError as exc:
+                raise lib.ArchivePathSafetyError(
+                    "抓取批次锁无法安全校验"
+                ) from exc
+            if (not stat.S_ISREG(lock_info.st_mode)
+                    or lock_info.st_uid != os.geteuid()
+                    or lock_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+                raise lib.ArchivePathSafetyError(
+                    "抓取批次锁必须是当前用户持有的可信普通文件"
+                )
+            with _HELD_LOCKS_GUARD:
+                if held_key in _HELD_LOCKS:
+                    raise FetchLockedError(
+                        "同一归档与日期已有抓取任务运行：%s"
+                        % normalized_day
+                    )
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
                 raise FetchLockedError(
                     "同一归档与日期已有抓取任务运行：%s" % normalized_day
-                )
-            _HELD_LOCKS.add(held_key)
-        acquired = True
-        os.ftruncate(descriptor, 0)
-        os.write(
-            descriptor,
-            ("pid=%s\narchive=%s\ndate=%s\n" % (
-                os.getpid(), archive_identity, normalized_day
-            )).encode("utf-8"),
-        )
-        os.fsync(descriptor)
-        yield lock_path
-    finally:
-        if acquired:
+                ) from exc
+            except OSError as exc:
+                if exc.errno in (
+                        errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK):
+                    raise FetchLockedError(
+                        "同一归档与日期已有抓取任务运行：%s"
+                        % normalized_day
+                    ) from exc
+                raise lib.ArchivePathSafetyError(
+                    "抓取批次锁操作失败"
+                ) from exc
             with _HELD_LOCKS_GUARD:
-                _HELD_LOCKS.discard(held_key)
+                if held_key in _HELD_LOCKS:
+                    raise FetchLockedError(
+                        "同一归档与日期已有抓取任务运行：%s"
+                        % normalized_day
+                    )
+                _HELD_LOCKS.add(held_key)
+            acquired = True
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-            except OSError:
-                pass
-        os.close(descriptor)
+                os.ftruncate(descriptor, 0)
+                os.write(
+                    descriptor,
+                    ("pid=%s\narchive=%s\ndate=%s\n" % (
+                        os.getpid(), archive_identity, normalized_day
+                    )).encode("utf-8"),
+                )
+                os.fsync(descriptor)
+            except OSError as exc:
+                raise lib.ArchivePathSafetyError(
+                    "抓取批次锁状态写入失败"
+                ) from exc
+            yield lock_path
+        finally:
+            if acquired:
+                with _HELD_LOCKS_GUARD:
+                    _HELD_LOCKS.discard(held_key)
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            os.close(descriptor)
+
+
+def _source_evidence_lock_path(archive_root, source, day):
+    """Return the canonical cross-process source/date lock identity."""
+    normalized_source = lib.validate_source_id(source)
+    normalized_day = lib.norm_day(day).isoformat()
+    archive_identity = lib.archive_lock_identity(archive_root)
+    lock_key = hashlib.sha256((
+        archive_identity + "\0source-evidence\0"
+        + normalized_source + "\0" + normalized_day
+    ).encode("utf-8")).hexdigest()
+    lock_directory = lib._absolute_path(lib.SOURCE_EVIDENCE_LOCK_ROOT)
+    return (
+        os.path.join(lock_directory, lock_key + ".lock"),
+        lock_key,
+        archive_identity,
+        normalized_source,
+        normalized_day,
+    )
+
+
+@contextlib.contextmanager
+def fetch_source_evidence_lock(archive_root, source, day):
+    """Serialize mutation of one source/date evidence tree.
+
+    The lock identity and acquisition order are shared with local-PDF import,
+    workbench reads/drafts, and publishing.  Fetch ordering is always
+    coordinator -> source evidence; downstream operations never acquire the
+    coordinator, so no inverse order exists.
+    """
+    lock_path, lock_key, archive_identity, source, normalized_day = (
+        _source_evidence_lock_path(archive_root, source, day)
+    )
+    with _SOURCE_LOCKS_GUARD:
+        thread_lock = _SOURCE_LOCKS.setdefault(lock_key, threading.Lock())
+    with thread_lock:
+        with lib.source_evidence_lock_directory() as (
+                lock_directory_fd, pinned_lock_directory):
+            if pinned_lock_directory != os.path.dirname(lock_path):
+                raise lib.ArchivePathSafetyError(
+                    "报纸来源证据锁目录身份不一致"
+                )
+            try:
+                descriptor = lib.open_lock_file_at(
+                    lock_directory_fd, os.path.basename(lock_path), 0o600,
+                )
+            except OSError as exc:
+                raise lib.ArchivePathSafetyError(
+                    "报纸来源证据锁无法安全打开"
+                ) from exc
+            locked = False
+            try:
+                try:
+                    lock_info = os.fstat(descriptor)
+                    if (not stat.S_ISREG(lock_info.st_mode)
+                            or lock_info.st_uid != os.geteuid()
+                            or lock_info.st_mode
+                            & (stat.S_IWGRP | stat.S_IWOTH)):
+                        raise lib.ArchivePathSafetyError(
+                            "报纸来源证据锁必须是当前用户持有的可信普通文件"
+                        )
+                    fcntl.flock(descriptor, fcntl.LOCK_EX)
+                    locked = True
+                    os.ftruncate(descriptor, 0)
+                    os.write(descriptor, (
+                        "pid=%s\narchive=%s\nsource=%s\ndate=%s\n" % (
+                            os.getpid(), archive_identity, source,
+                            normalized_day,
+                        )
+                    ).encode("utf-8"))
+                    os.fsync(descriptor)
+                except OSError as exc:
+                    raise lib.ArchivePathSafetyError(
+                        "报纸来源证据锁操作失败"
+                    ) from exc
+                yield lock_path
+            finally:
+                if locked:
+                    try:
+                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+                os.close(descriptor)
 
 
 def load_adapter(channel):
@@ -341,10 +485,11 @@ def _issue_evidence_digest(issue_dir, source_id, day):
     try:
         snapshot = dict(lib.read_tree_files(issue_dir))
         issue = json.loads(snapshot["issue.json"].decode("utf-8"))
+    except (lib.ArchivePathSafetyError, lib.ArchiveConflictError):
+        raise
     except (OSError, UnicodeError, ValueError):
         return None
-    except (KeyError, json.JSONDecodeError, lib.ArchivePathSafetyError,
-            lib.ArchiveConflictError):
+    except (KeyError, json.JSONDecodeError):
         return None
     if (not isinstance(issue, dict)
             or issue.get("source") != source_id
@@ -370,7 +515,8 @@ def _issue_evidence_digest(issue_dir, source_id, day):
     return digest.hexdigest()
 
 
-def _stage_skip_status(state, stage, src, day, aps):
+def _stage_skip_status(
+        state, stage, src, day, aps, evidence_digest_getter=None):
     """Return whether a completed marker is bound to current code/evidence."""
     if not isinstance(state, dict):
         return False, "无状态记录"
@@ -388,7 +534,11 @@ def _stage_skip_status(state, stage, src, day, aps):
             and state.get("parser_contract_version")
             != _stage_contract_version(src, "parsed")):
         return False, "parsed 契约版本缺失或不匹配"
-    current_digest = _issue_evidence_digest(aps["dir"], src["id"], day)
+    current_digest = (
+        evidence_digest_getter()
+        if evidence_digest_getter is not None
+        else _issue_evidence_digest(aps["dir"], src["id"], day)
+    )
     if not current_digest:
         return False, "当前 issue 缺失或证据不可验证"
     if state.get("issue_evidence_sha256") != current_digest:
@@ -448,8 +598,10 @@ def _record_source_failure(root, daily_log, src, day, note):
     aps = lib.archive_paths(root, sid, day)
     try:
         lib.state_mark(aps["state"], "failed", note=message)
+    except lib.PIPELINE_FATAL_EXCEPTIONS:
+        raise
     except Exception as exc:  # noqa: BLE001
-        print("  failed 状态保存失败:", exc)
+        _source_print(sid, "failed 状态保存失败:", exc)
     try:
         lib.log_line(daily_log, {
             "source": sid,
@@ -458,8 +610,10 @@ def _record_source_failure(root, daily_log, src, day, note):
             "stage": "failed",
             "note": message,
         })
+    except lib.PIPELINE_FATAL_EXCEPTIONS:
+        raise
     except Exception as exc:  # noqa: BLE001
-        print("  failed 日志保存失败:", exc)
+        _source_print(sid, "failed 日志保存失败:", exc)
 
 
 class _IssueRefreshTransaction:
@@ -501,9 +655,18 @@ class _IssueRefreshTransaction:
                 if not lib.path_is_file(self.state_path):
                     raise ValueError("流水线状态必须是普通文件")
                 self.state_bytes = lib.read_bytes(self.state_path)
-        except BaseException:
-            if lib.path_exists(self.snapshot_root):
-                lib.durable_rmtree(self.snapshot_root)
+        except BaseException as primary_error:
+            try:
+                if lib.path_exists(self.snapshot_root):
+                    lib.durable_rmtree(self.snapshot_root)
+            except BaseException as cleanup_error:
+                failure = FetchFatalError(
+                    "流水线快照初始化失败，且暂存目录未完成耐久清理：%s"
+                    % self.snapshot_root
+                )
+                failure.primary_error = primary_error
+                failure.cleanup_error = cleanup_error
+                raise failure from primary_error
             raise
 
     @staticmethod
@@ -520,32 +683,32 @@ class _IssueRefreshTransaction:
         if self.finished:
             return
         if self.rollback_attempted:
-            raise RuntimeError("流水线耐久回滚此前未完成，拒绝重复宣称完成")
+            raise FetchFatalError("流水线耐久回滚此前未完成，拒绝重复宣称完成")
         if self.commit_attempted:
-            raise RuntimeError("流水线已进入提交收尾，不能再执行回滚")
+            raise FetchFatalError("流水线已进入提交收尾，不能再执行回滚")
         self.rollback_attempted = True
         try:
             if self.had_issue:
                 if not lib.path_is_dir(self.snapshot_issue):
-                    raise RuntimeError("旧期次快照缺失，无法恢复")
+                    raise FetchFatalError("旧期次快照缺失，无法恢复")
                 lib.replace_issue_directory(self.snapshot_issue, self.issue_dir)
                 self.snapshot_root = None
             elif lib.path_exists(self.issue_dir):
                 if not lib.path_is_dir(self.issue_dir):
-                    raise RuntimeError("新期次路径类型异常，拒绝自动删除")
+                    raise FetchFatalError("新期次路径类型异常，拒绝自动删除")
                 lib.durable_rmtree(self.issue_dir)
 
             if self.had_state:
                 self._restore_bytes(self.state_path, self.state_bytes)
             elif lib.path_exists(self.state_path):
                 if not lib.path_is_file(self.state_path):
-                    raise RuntimeError("新状态路径类型异常，拒绝自动删除")
+                    raise FetchFatalError("新状态路径类型异常，拒绝自动删除")
                 lib.durable_unlink(self.state_path)
             if self.snapshot_root:
                 lib.durable_rmtree(self.snapshot_root, missing_ok=True)
                 self.snapshot_root = None
         except BaseException as exc:
-            raise RuntimeError(
+            raise FetchFatalError(
                 "流水线耐久回滚未完成；请检查 issue=%s、state=%s、snapshot=%s"
                 % (self.issue_dir, self.state_path, self.snapshot_root or "无")
             ) from exc
@@ -555,16 +718,16 @@ class _IssueRefreshTransaction:
         if self.finished:
             return
         if self.commit_attempted:
-            raise RuntimeError("流水线提交收尾此前未完成")
+            raise FetchFatalError("流水线提交收尾此前未完成")
         if self.rollback_attempted:
-            raise RuntimeError("流水线已经回滚，不能再提交")
+            raise FetchFatalError("流水线已经回滚，不能再提交")
         self.commit_attempted = True
         try:
             if self.snapshot_root:
                 lib.durable_rmtree(self.snapshot_root, missing_ok=True)
                 self.snapshot_root = None
         except BaseException as exc:
-            raise RuntimeError(
+            raise FetchFatalError(
                 "新期次已完成，但事务快照未完成耐久清理：%s"
                 % (self.snapshot_root or "无")
             ) from exc
@@ -580,23 +743,23 @@ def _run_atomic_refresh(src, day, root, args, daily_log, ad, acquire, aps):
             ok, note = acquire(
                 src, day, root, offline_ok=args.offline
             ) if src["channel"] == "wechat_read" else acquire(src, day, root)
-            print("  acquire:", note)
+            _source_print(sid, "acquire:", note)
             if not ok:
                 transaction.rollback()
-                print("  acquire 失败:", note)
+                _source_print(sid, "acquire 失败:", note)
                 _record_source_failure(root, daily_log, src, day, note)
                 return "failed"
 
         issue, err = ad.fetch(src, day, root)
         if err:
             transaction.rollback()
-            print("  fetch 失败:", err)
+            _source_print(sid, "fetch 失败:", err)
             _record_source_failure(root, daily_log, src, day, err)
             return "failed"
         if not isinstance(issue, dict):
             raise RuntimeError("fetch 未返回有效 issue")
         ok, chain = lib.chain_check(root, sid, day, issue.get("issue_no"))
-        print("  fetch ok;", "👍" if ok else "⚠️", chain)
+        _source_print(sid, "fetch ok;", "👍" if ok else "⚠️", chain)
         _mark_versioned_stage(
             aps, src, day, "fetched",
             edition_no=len(issue.get("editions", [])),
@@ -611,7 +774,7 @@ def _run_atomic_refresh(src, day, root, args, daily_log, ad, acquire, aps):
         issue, err = ad.parse(src, day, root)
         if err:
             transaction.rollback()
-            print("  parse 失败:", err)
+            _source_print(sid, "parse 失败:", err)
             _record_source_failure(root, daily_log, src, day, err)
             return "failed"
         if not isinstance(issue, dict):
@@ -624,7 +787,7 @@ def _run_atomic_refresh(src, day, root, args, daily_log, ad, acquire, aps):
             "issue_json": aps["issue_json"],
         })
         transaction.commit()
-        print("  parsed ok:", units, "units")
+        _source_print(sid, "parsed ok:", units, "units")
         return "ok"
     except BaseException:
         if not transaction.rollback_attempted and not transaction.commit_attempted:
@@ -636,7 +799,7 @@ def _run_source_in_archive_session(src, day, root, args, daily_log):
     sid = src["id"]
     aps = lib.archive_paths(root, sid, day)
     ad = load_adapter(src["channel"])
-    print(f"\n=== [{sid}] {src['name']} {day} ===")
+    _source_header(sid, src["name"], day)
     acquire = getattr(ad, "acquire", None)
 
     stages = set(args.stage.split(","))
@@ -644,17 +807,32 @@ def _run_source_in_archive_session(src, day, root, args, daily_log):
         stage for stage in ("fetched", "parsed") if stage in stages
     ]
     skipped_stages = 0
+    cached_evidence = []
+
+    def current_evidence_digest():
+        # A completed fetched→parsed skip path never mutates the issue tree.
+        # Reuse its one strong digest across both marker checks instead of
+        # reading every page twice on routine daily reruns.
+        if not cached_evidence:
+            cached_evidence.append(
+                _issue_evidence_digest(aps["dir"], sid, day)
+            )
+        return cached_evidence[0]
+
     if "fetched" in stages:
         state = lib.load_json(aps["state"])
         can_skip, skip_note = _stage_skip_status(
-            state, "fetched", src, day, aps
+            state, "fetched", src, day, aps,
+            evidence_digest_getter=current_evidence_digest,
         )
         if can_skip and not args.no_state_skip:
-            print("  fetched 已完成且%s，跳过" % skip_note)
+            _source_print(sid, "fetched 已完成且%s，跳过" % skip_note)
             skipped_stages += 1
         else:
             if not args.no_state_skip:
-                print("  fetched 状态不可复用：%s，强制重跑" % skip_note)
+                _source_print(
+                    sid, "fetched 状态不可复用：%s，强制重跑" % skip_note
+                )
             if "parsed" in stages:
                 return _run_atomic_refresh(
                     src, day, root, args, daily_log, ad, acquire, aps
@@ -663,20 +841,20 @@ def _run_source_in_archive_session(src, day, root, args, daily_log):
                 ok, note = acquire(
                     src, day, root, offline_ok=args.offline
                 ) if src["channel"] == "wechat_read" else acquire(src, day, root)
-                print("  acquire:", note)
+                _source_print(sid, "acquire:", note)
                 if not ok:
-                    print("  acquire 失败:", note)
+                    _source_print(sid, "acquire 失败:", note)
                     _record_source_failure(root, daily_log, src, day, note)
                     return "failed"
             issue, err = ad.fetch(src, day, root)
             if err:
-                print("  fetch 失败:", err)
+                _source_print(sid, "fetch 失败:", err)
                 _record_source_failure(root, daily_log, src, day, err)
                 return "failed"
             if not isinstance(issue, dict):
                 raise RuntimeError("fetch 未返回有效 issue")
             ok, chain = lib.chain_check(root, sid, day, issue.get("issue_no"))
-            print("  fetch ok;", "👍" if ok else "⚠️", chain)
+            _source_print(sid, "fetch ok;", "👍" if ok else "⚠️", chain)
             _mark_versioned_stage(
                 aps, src, day, "fetched",
                 edition_no=len(issue.get("editions", [])),
@@ -690,10 +868,11 @@ def _run_source_in_archive_session(src, day, root, args, daily_log):
     if "parsed" in stages:
         state = lib.load_json(aps["state"])
         can_skip, skip_note = _stage_skip_status(
-            state, "parsed", src, day, aps
+            state, "parsed", src, day, aps,
+            evidence_digest_getter=current_evidence_digest,
         )
         if can_skip and not args.no_state_skip:
-            print("  parsed 已完成且%s，跳过" % skip_note)
+            _source_print(sid, "parsed 已完成且%s，跳过" % skip_note)
             skipped_stages += 1
             return (
                 "skipped"
@@ -701,10 +880,12 @@ def _run_source_in_archive_session(src, day, root, args, daily_log):
                 else "ok"
             )
         if not args.no_state_skip:
-            print("  parsed 状态不可复用：%s，强制重跑" % skip_note)
+            _source_print(
+                sid, "parsed 状态不可复用：%s，强制重跑" % skip_note
+            )
         issue, err = ad.parse(src, day, root)
         if err:
-            print("  parse 失败:", err)
+            _source_print(sid, "parse 失败:", err)
             _record_source_failure(root, daily_log, src, day, err)
             return "failed"
         if not isinstance(issue, dict):
@@ -715,7 +896,7 @@ def _run_source_in_archive_session(src, day, root, args, daily_log):
             "source": sid, "source_name": src["name"], "date": day.isoformat(),
             "stage": "parsed", "units": n, "issue_json": aps["issue_json"],
         })
-        print("  parsed ok:", n, "units")
+        _source_print(sid, "parsed ok:", n, "units")
     if requested_stages and skipped_stages == len(requested_stages):
         return "skipped"
     return "ok"
@@ -734,6 +915,112 @@ def _run_source(src, day, root, args, daily_log):
         )
 
 
+_FATAL_SOURCE_EXCEPTIONS = (
+    FetchFatalError,
+) + lib.PIPELINE_FATAL_EXCEPTIONS
+
+
+def _run_source_task(
+        src, day, root, args, daily_log, coordinator_archive=None):
+    """Run and account for one isolated source while its evidence is locked."""
+    session_context = (
+        lib.fork_archive_session(coordinator_archive)
+        if coordinator_archive is not None
+        else contextlib.nullcontext()
+    )
+    # Bind the exact descriptor pinned by main before computing the source lock
+    # or touching evidence.  A pathname reopened here could have been replaced
+    # with another valid directory after the coordinator's isolation check.
+    try:
+        with session_context:
+            with fetch_source_evidence_lock(root, src["id"], day):
+                try:
+                    return _run_source(src, day, root, args, daily_log)
+                except _FATAL_SOURCE_EXCEPTIONS:
+                    # Archive/process safety failures abort the batch; they are
+                    # never downgraded to a routine upstream-source failure.
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    _source_print(
+                        src.get("id", "unknown"), "来源执行异常:", exc
+                    )
+                    _record_source_failure(root, daily_log, src, day, exc)
+                    return "failed"
+    finally:
+        lib.close_http_client()
+
+
+def run_sources(
+        sources, day, root, args, daily_log, workers=4,
+        coordinator_archive=None):
+    """Run independent source pipelines with bounded concurrency.
+
+    One submitted task owns a source's complete fetch→parse transaction, so
+    stages never overlap within a source.  Exceptions from ordinary upstream
+    failures are isolated by ``_run_source_task``; archive safety conflicts
+    abort the batch after already-running workers unwind safely.
+    """
+    sources = list(sources)
+    if not sources:
+        return {"ok": 0, "failed": 0, "skipped": 0}
+    if not isinstance(workers, int) or isinstance(workers, bool):
+        raise ValueError("workers 必须是整数")
+    if not 1 <= workers <= 8:
+        raise ValueError("workers 必须在 1 到 8 之间")
+    if coordinator_archive is None:
+        # Public callers receive the same root-identity guarantee as main:
+        # create/pin once, then fd-clone that exact directory into each worker.
+        with lib.archive_session(root, create=True) as archive_handle:
+            return run_sources(
+                sources, day, archive_handle.canonical_root, args, daily_log,
+                workers=workers, coordinator_archive=archive_handle,
+            )
+
+    counts = {"ok": 0, "failed": 0, "skipped": 0}
+    fatal_error = None
+    executor = None
+    futures = {}
+    try:
+        executor = ThreadPoolExecutor(
+            max_workers=min(workers, len(sources)),
+            thread_name_prefix="readdaily-source",
+        )
+        for src in sources:
+            task_args = (src, day, root, args, daily_log)
+            if coordinator_archive is not None:
+                task_args += (coordinator_archive,)
+            futures[executor.submit(_run_source_task, *task_args)] = src
+        for future in as_completed(futures):
+            try:
+                outcome = future.result()
+            except CancelledError:
+                continue
+            except _FATAL_SOURCE_EXCEPTIONS as exc:
+                if fatal_error is None:
+                    fatal_error = exc
+                    for pending in futures:
+                        if pending is not future:
+                            pending.cancel()
+                continue
+            counts[outcome] += 1
+    except BaseException:
+        # Ctrl-C, executor submission failures, and unexpected collection
+        # errors must not allow queued sources to start afterward.  Running
+        # source transactions still unwind before control returns to caller.
+        for pending in futures:
+            pending.cancel()
+        raise
+    finally:
+        # Running adapter transactions cannot be interrupted without risking
+        # partial external work.  Pending tasks are cancelled on a fatal
+        # archive error; running ones are allowed to reach their atomic unwind.
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+    if fatal_error is not None:
+        raise fatal_error
+    return counts
+
+
 def main():
     ap = argparse.ArgumentParser(description="newspaper-fetch 编排器")
     ap.add_argument("--date", default=None, help="YYYY-MM-DD，默认今天")
@@ -745,6 +1032,10 @@ def main():
     ap.add_argument("--registry", default=REGISTRY)
     ap.add_argument("--vault", default=None, help="Obsidian Vault，用于写入边界校验")
     ap.add_argument("--no-state-skip", action="store_true", help="忽略状态机直接重跑")
+    ap.add_argument(
+        "--workers", type=int, choices=range(1, 9), default=4,
+        metavar="N", help="跨报纸并发数（1-8，默认 4；单报纸内仍串行）",
+    )
     args = ap.parse_args()
 
     reg = load_registry(args.registry)
@@ -755,11 +1046,44 @@ def main():
         root = resolve_archive_root(reg)
         root = validate_archive_outside_vault(root, args.vault)
         validate_registry_write_roots_outside_vault(reg, args.vault)
+        requested_stages = [
+            value.strip() for value in str(args.stage).split(",")
+        ]
+        invalid_stages = [
+            value for value in requested_stages
+            if value not in ("fetched", "parsed")
+        ]
+        if not requested_stages or invalid_stages:
+            raise ValueError(
+                "--stage 仅支持 fetched、parsed，且不能为空：%s"
+                % (", ".join(invalid_stages) or "空值")
+            )
+        args.stage = ",".join(requested_stages)
+
+        requested_ids = None
+        if args.source is not None:
+            requested_ids = [
+                value.strip() for value in str(args.source).split(",")
+            ]
+            if not requested_ids or any(not value for value in requested_ids):
+                raise ValueError("--source 不能为空或包含空来源 id")
+            for source_id in requested_ids:
+                lib.validate_source_id(source_id)
+            known_ids = {source["id"] for source in reg["sources"]}
+            unknown_ids = sorted(set(requested_ids) - known_ids)
+            if unknown_ids:
+                raise ValueError("未知来源 id：%s" % ", ".join(unknown_ids))
+        want = [
+            source for source in reg["sources"]
+            if (
+                source["id"] in requested_ids
+                if requested_ids is not None
+                else source.get("enabled")
+            )
+        ]
     except ValueError as exc:
         sys.exit(str(exc))
     d = lib.norm_day(args.date or datetime.date.today())
-    want = [s for s in reg["sources"]
-            if (args.source and s["id"] in args.source.split(",")) or (not args.source and s.get("enabled"))]
 
     if args.probe:
         src = next((s for s in reg["sources"] if s["id"] == args.probe), None)
@@ -770,7 +1094,6 @@ def main():
         print(json.dumps(res, ensure_ascii=False, indent=1))
         return
 
-    counts = {"ok": 0, "failed": 0, "skipped": 0}
     try:
         # Open the user-configured path itself without following links, then
         # repeat Vault isolation against that pinned identity. This closes the
@@ -782,34 +1105,12 @@ def main():
             root = archive_handle.canonical_root
             daily_log = os.path.join(root, "_dailylog.jsonl")
             with fetch_date_lock(root, d):
-                for src in want:
-                    try:
-                        try:
-                            outcome = _run_source(
-                                src, d, root, args, daily_log
-                            )
-                        except Exception as exc:  # noqa: BLE001
-                            print("\n=== [%s] %s %s ===" % (
-                                src.get("id", "unknown"),
-                                src.get("name", "未知来源"), d
-                            ))
-                            print("  来源执行异常:", exc)
-                            _record_source_failure(
-                                root, daily_log, src, d, exc
-                            )
-                            outcome = "failed"
-                    except Exception as exc:  # noqa: BLE001
-                        # An identity conflict makes another archive write
-                        # unsafe. The outer pinned session will also fail.
-                        print("\n=== [%s] %s %s ===" % (
-                            src.get("id", "unknown"),
-                            src.get("name", "未知来源"), d
-                        ))
-                        print("  归档身份冲突，来源已失败:", exc)
-                        outcome = "failed"
-                    counts[outcome] += 1
-    except (FetchLockedError, lib.ArchivePathSafetyError,
-            lib.ArchiveConflictError) as exc:
+                counts = run_sources(
+                    want, d, root, args, daily_log, workers=args.workers,
+                    coordinator_archive=archive_handle,
+                )
+    except (FetchLockedError, FetchFatalError, lib.ArchivePathSafetyError,
+            lib.ArchiveConflictError, lib.ArchiveTransactionError) as exc:
         sys.exit(str(exc))
 
     print("\n完成：成功 %s，失败 %s，跳过 %s" % (

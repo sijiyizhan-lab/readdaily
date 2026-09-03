@@ -1,5 +1,6 @@
-import builtins
 import importlib.util
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -105,45 +106,58 @@ class FetchConfigurationTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     fetch.validate_registry(registry)
 
-    def test_paper_api_uses_stdlib_when_requests_is_unavailable(self):
-        class FakeResponse:
-            status = 200
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return False
-
-            def read(self):
-                return b'{"obj":{"editionList":[]}}'
-
-        real_import = builtins.__import__
-
-        def import_without_requests(name, *args, **kwargs):
-            if name == "requests":
-                raise ImportError("requests intentionally unavailable")
-            return real_import(name, *args, **kwargs)
-
+    def test_paper_api_uses_shared_thread_local_http_post(self):
         source = {
             "entry": "https://example.test/",
             "api": {"base": "https://example.test/api"},
         }
-        with mock.patch("builtins.__import__", side_effect=import_without_requests), \
-                mock.patch("urllib.request.urlopen", return_value=FakeResponse()) as opened:
+        with mock.patch.object(
+                paper_api.lib,
+                "http_post_json",
+                return_value=(
+                    200,
+                    "https://example.test/api/period",
+                    b'{"obj":{"editionList":[]}}',
+                ),
+        ) as posted:
             result = paper_api._api(source, "/period", {"date": "2026-09-03"})
 
         self.assertEqual(result, {"obj": {"editionList": []}})
-        request = opened.call_args.args[0]
-        self.assertEqual(request.get_method(), "POST")
-        self.assertEqual(
-            json.loads(request.data.decode("utf-8")),
+        self.assertEqual(posted.call_args.args[:2], (
+            "https://example.test/api/period",
             {"date": "2026-09-03"},
+        ))
+        self.assertEqual(
+            posted.call_args.kwargs["timeout"], 20
         )
 
     def test_wechat_engine_does_not_require_pillow(self):
         engine = (FETCH_SCRIPTS / "wechat_engine.py").read_text(encoding="utf-8")
         self.assertNotIn("from PIL import Image", engine)
+
+    def test_cli_rejects_empty_or_unknown_stage_and_source(self):
+        registry = {
+            "archive_root": "/unused/archive",
+            "sources": [{
+                "id": "known", "name": "已知报纸",
+                "channel": "founder", "enabled": True,
+            }],
+        }
+        invalid_argv = (
+            (["fetch.py", "--stage", ""], "--stage"),
+            (["fetch.py", "--stage", "summarized"], "summarized"),
+            (["fetch.py", "--source", "unknown"], "未知来源 id"),
+            (["fetch.py", "--source", "known,"], "--source"),
+        )
+        for argv, expected in invalid_argv:
+            with self.subTest(argv=argv), mock.patch.object(
+                    sys, "argv", argv), mock.patch.object(
+                        fetch, "load_registry", return_value=registry
+                    ), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as caught:
+                    fetch.main()
+            self.assertNotEqual(caught.exception.code, 0)
+            self.assertIn(expected, str(caught.exception))
 
 
 if __name__ == "__main__":

@@ -336,6 +336,8 @@ def fetch(src, d, archive_root):
         data_status, data_final_url, data_text = _get_response(
             data_url, ref=page1_url
         )
+    except lib.PIPELINE_FATAL_EXCEPTIONS:
+        raise
     except Exception as exc:  # noqa: BLE001
         return None, "高清版面清单下载异常：%s；整期未归档" % exc
     if data_status != 200:
@@ -402,6 +404,8 @@ def fetch(src, d, archive_root):
             image_status, image_final_url, image_bytes = lib.http_get(
                 image_url, referer=unit["url"]
             )
+        except lib.PIPELINE_FATAL_EXCEPTIONS:
+            raise
         except Exception as exc:  # noqa: BLE001
             return None, "第%s版原图下载异常：%s；整期未归档" % (number, exc)
         if image_status != 200:
@@ -458,6 +462,8 @@ def fetch(src, d, archive_root):
                   "fetched_at": datetime.datetime.now().isoformat(timespec="seconds")}
     try:
         lib.commit_issue_tree(aps["dir"], page_downloads, issue_meta)
+    except lib.PIPELINE_FATAL_EXCEPTIONS:
+        raise
     except Exception as exc:  # noqa: BLE001
         return None, "整期归档事务失败：%s" % exc
     return issue_meta, None
@@ -497,6 +503,8 @@ def parse(src, d, archive_root, max_per_edition=30):
                 )
             try:
                 st, final_url, h = _get_response(au, ref=u.get("url"))
+            except lib.PIPELINE_FATAL_EXCEPTIONS:
+                raise
             except Exception as exc:  # noqa: BLE001
                 return issue, "第%s版第%s篇文章访问异常：%s" % (
                     unit_index, article_index, exc

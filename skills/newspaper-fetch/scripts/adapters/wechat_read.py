@@ -195,6 +195,8 @@ def _verified_daily_artifacts(engine, out, d):
     """Check downloader claims; fetch still validates every image entity."""
     try:
         artifacts = engine.verify_artifacts(out, d)
+    except lib.PIPELINE_FATAL_EXCEPTIONS:
+        raise
     except Exception as exc:  # noqa: BLE001
         return None, "当日产物校验失败：%s" % exc
     if not isinstance(artifacts, dict):
@@ -397,6 +399,8 @@ def fetch(source_cfg, d, archive_root):
     if not issue_no:
         try:
             issue_no = ocr_issue(buffered_pages[0]["source_path"])
+        except lib.PIPELINE_FATAL_EXCEPTIONS:
+            raise
         except RuntimeError as exc:
             return None, "头版期号 OCR 失败：%s" % exc
     issue = {
@@ -422,6 +426,8 @@ def fetch(source_cfg, d, archive_root):
             ],
             issue,
         )
+    except lib.PIPELINE_FATAL_EXCEPTIONS:
+        raise
     except (OSError, RuntimeError) as exc:
         return None, "归档写入失败：%s" % exc
     return issue, None
@@ -492,18 +498,35 @@ def parse(source_cfg, d, archive_root):
                 descriptor, ocr_input = tempfile.mkstemp(
                     prefix="readdaily-wechat-ocr-", suffix=".jpg"
                 )
+                primary_error = None
                 try:
                     with os.fdopen(descriptor, "wb") as stream:
                         descriptor = -1
                         stream.write(image_bytes)
                     text = ocr_image(ocr_input)
+                except BaseException as exc:
+                    primary_error = exc
+                    raise
                 finally:
+                    cleanup_error = None
                     if descriptor >= 0:
-                        os.close(descriptor)
+                        try:
+                            os.close(descriptor)
+                        except BaseException as exc:
+                            cleanup_error = exc
                     try:
                         os.unlink(ocr_input)
                     except FileNotFoundError:
                         pass
+                    except BaseException as exc:
+                        if cleanup_error is None:
+                            cleanup_error = exc
+                    if cleanup_error is not None:
+                        if primary_error is not None:
+                            raise primary_error from cleanup_error
+                        raise cleanup_error
+            except lib.PIPELINE_FATAL_EXCEPTIONS:
+                raise
             except RuntimeError as exc:
                 return issue, "第%s版 OCR 失败：%s" % (unit_index, exc)
         if not isinstance(text, str) or len(text.strip()) < MIN_OCR_CHARACTERS:
@@ -554,6 +577,8 @@ def parse(source_cfg, d, archive_root):
                 ).encode("utf-8"),
             ))
         lib.commit_issue_tree(aps["dir"], files, parsed)
+    except lib.PIPELINE_FATAL_EXCEPTIONS:
+        raise
     except (OSError, RuntimeError, shutil.Error) as exc:
         return issue, "OCR 归档写入失败：%s" % exc
     return parsed, None

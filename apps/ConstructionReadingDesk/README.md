@@ -17,11 +17,11 @@ swift run ConstructionReadingDesk
 - 报纸归档目录：默认 `~/Library/Application Support/readdaily/news-archive`
 - Obsidian Vault：默认 `~/Maitty的知识库`
 
-应用通过参数数组调用后端，不通过 shell 拼接参数。读取工作台数据时直接运行 API 脚本以缩短每次进程启动时间；抓取仍由顶层编排器执行。Python 位置依次读取 `READDAILY_PYTHON`，再探测 Homebrew 与系统常见位置：
+应用通过参数数组调用后端，不通过 shell 拼接参数。读取工作台数据时直接运行 API 脚本，抓取则直接运行包内抓取器，避免额外的 Python 转发进程。Python 位置依次读取 `READDAILY_PYTHON`，再探测 Homebrew 与系统常见位置：
 
 ```text
 python3 <bundle-or-repo>/skills/newspaper-reader/scripts/workbench_api.py <command> --archive <path> --vault <path>
-python3 <bundle-or-repo>/scripts/readdaily.py fetch --date <date>
+python3 <bundle-or-repo>/skills/newspaper-fetch/scripts/fetch.py --registry <bundle-or-repo>/skills/newspaper-fetch/sources.json --date <date>
 ```
 
 命令行用户仍可继续使用兼容入口 `python3 scripts/readdaily.py api <command> ...`。
@@ -35,7 +35,7 @@ python3 <bundle-or-repo>/scripts/readdaily.py fetch --date <date>
 open "dist/Read Daily.app"
 ```
 
-默认产物是 `dist/Read Daily.app`，并同时生成可上传 GitHub Release 的 `dist/Read-Daily-v0.3.1-macOS-arm64.zip` 与 `.sha256`。也可传入一个以 `.app` 结尾的输出路径：
+默认产物是 `dist/Read Daily.app`，并同时生成可上传 GitHub Release 的 `dist/Read-Daily-v0.3.2-macOS-arm64.zip` 与 `.sha256`。也可传入一个以 `.app` 结尾的输出路径：
 
 ```bash
 ./scripts/build_macos_app.sh "$HOME/Desktop/Read Daily.app"
@@ -80,7 +80,7 @@ swift test --package-path apps/ConstructionReadingDesk --enable-swift-testing --
 swift build --package-path apps/ConstructionReadingDesk -c release
 ```
 
-测试覆盖版本化 Codable、真实 API 载荷映射、进程命令参数、严格 stdout JSON、中文错误、复核编辑状态、异步版图换页、快速切报竞态、阅读状态合并、缓存失效与响应式/可访问性策略。v0.3.1 发布基线为 81 项 Swift 测试（12 个套件）与仓库级 316 项 Python 测试。
+测试覆盖版本化 Codable、真实 API 载荷映射、进程命令参数、严格 stdout JSON、中文错误、复核编辑状态、异步版图换页、真实挂起抓取期间的同日切报与换版、迟到输入隔离、阅读状态合并、缓存失效与响应式/可访问性策略。v0.3.2 发布基线为 103 项 Swift 测试（13 个套件）与仓库级 354 项 Python 测试。
 
 ## 边界
 
@@ -88,7 +88,7 @@ swift build --package-path apps/ConstructionReadingDesk -c release
 - 草稿临时 JSON 写入系统临时目录，调用结束后删除。
 - OCR、原版图、缓存、日志、发布计划和事务快照均留在归档目录。
 - 所有抓取、导入、草稿、阅读记录和发布入口都会拒绝归档与 Vault 相等、软链别名或父子重叠；它们先从原始配置路径逐级以 `O_NOFOLLOW` 固定目录句柄，再完成隔离校验并在整个操作中复用；切换路径设置需明确应用，旧工作区会先清空再重载。
-- 抓取按“归档目录 + 日期”加锁，同日手动抓取与定时任务不会竞争固定临时文件；各来源必须验证请求日期及重定向后的日期，拒绝把旧期写成当天。
+- 抓取使用“整批协调锁 + 报纸来源/日期证据锁”：同日手动抓取与定时任务不会重复执行，不同报纸可并行下载；读取、草稿、导入和发布只与同一报纸互斥。各来源仍必须验证请求日期及重定向后的日期，拒绝把旧期写成当天。
 - 抓取与解析以整期事务提交，失败会恢复原期；版图必须通过系统 ImageIO 的真实像素解码，通用版面至少为短边 1000、长边 1400 像素，高分辨率渠道使用更高门槛，不能仅凭文件头或文件体积进入归档。
 - 已发现的版次必须真实、连续且唯一，已发现的文章必须全部归属对应版次并完整解析；系统不会把缺版、孤立文章或正文截断伪装成成功。
 - 本地 PDF 必须逐页生成完整清单；报头日期唯一匹配后才可进入可发布状态，无法确认或冲突时只允许人工复核。导入先锁定稳定快照，保证 OCR、归档 PDF 与来源哈希来自同一字节版本。

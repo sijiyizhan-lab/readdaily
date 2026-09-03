@@ -97,7 +97,7 @@ def _fetch_state_marker_worker(
     sys.path.insert(0, str(FETCH_SCRIPTS))
     import fetch
     try:
-        with fetch.fetch_date_lock(archive, day):
+        with fetch.fetch_source_evidence_lock(archive, source, day):
             acquired.set()
             if not release.wait(timeout=5):
                 raise RuntimeError("抓取状态写入测试未收到继续信号")
@@ -830,12 +830,14 @@ class VaultPublisherTest(unittest.TestCase):
 
         marker.start()
         try:
-            self.assertTrue(acquired.wait(timeout=5), "抓取状态进程未取得日期锁")
+            self.assertTrue(
+                acquired.wait(timeout=5), "抓取状态进程未取得来源证据锁"
+            )
             rollback_thread = threading.Thread(target=run_rollback)
             rollback_thread.start()
             self.assertFalse(
                 rollback_done.wait(timeout=0.3),
-                "抓取仍持有日期锁时 rollback 不应进入状态清理",
+                "抓取仍持有来源证据锁时 rollback 不应进入状态清理",
             )
         finally:
             release.set()

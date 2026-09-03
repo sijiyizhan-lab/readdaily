@@ -116,7 +116,7 @@ public struct ArticleDraft: Codable, Equatable, Identifiable, Sendable {
         self.id = id
         self.title = title
         self.ocrText = ocrText
-        self.ocrBlocks = ocrBlocks
+        self.ocrBlocks = ocrBlocks.isEmpty ? OCRDocumentLayout.fallbackBlocks(from: ocrText) : ocrBlocks
         self.proofreadText = proofreadText ?? ocrText
         self.ocrReviewStatus = ocrReviewStatus
         self.ocrSuspicions = ocrSuspicions
@@ -133,7 +133,8 @@ public struct ArticleDraft: Codable, Equatable, Identifiable, Sendable {
         ocrText = try container.decodeIfPresent(String.self, forKey: .ocrText)
             ?? container.decodeIfPresent(String.self, forKey: .text)
             ?? ""
-        ocrBlocks = try container.decodeIfPresent([OCRContentBlock].self, forKey: .ocrBlocks) ?? []
+        let decodedBlocks = try container.decodeIfPresent([OCRContentBlock].self, forKey: .ocrBlocks) ?? []
+        ocrBlocks = decodedBlocks.isEmpty ? OCRDocumentLayout.fallbackBlocks(from: ocrText) : decodedBlocks
         proofreadText = try container.decodeIfPresent(String.self, forKey: .correctedOCRText)
             ?? container.decodeIfPresent(String.self, forKey: .legacyProofreadText)
             ?? ocrText
@@ -277,6 +278,12 @@ public struct OCRDocumentLayout: Equatable, Sendable {
             result.append(OCRParagraph(index: result.count, lines: current))
         }
         paragraphs = result
+    }
+
+    public static func fallbackBlocks(from text: String) -> [OCRContentBlock] {
+        OCRDocumentLayout(text: text).paragraphs.map { paragraph in
+            OCRContentBlock(kind: "paragraph", text: paragraph.lines.joined(separator: "\n"))
+        }
     }
 }
 

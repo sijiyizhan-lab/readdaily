@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -92,8 +93,18 @@ def _delayed_draft_worker(archive, vault, draft, at_write, release_write):
 
 def _publisher_evidence_lock_worker(archive, day, ready, entered):
     ready.set()
-    with api.vault_publisher._fetch_date_evidence_lock(archive, day):
+    with api.vault_publisher._fetch_source_evidence_lock(
+            archive, "zgjsb", day):
         entered.set()
+
+
+def _hold_publisher_evidence_lock(
+        archive, source, day, ready, release):
+    with api.vault_publisher._fetch_source_evidence_lock(
+            archive, source, day):
+        ready.set()
+        if not release.wait(timeout=8):
+            raise RuntimeError("来源证据锁测试未收到释放信号")
 
 
 def _concurrent_activity_worker(archive, vault, source, day, start, barrier):
@@ -129,6 +140,14 @@ class WorkbenchAPITest(unittest.TestCase):
         )
         bound["evidence_sha256"] = issue["evidence_sha256"]
         return bound
+
+    @staticmethod
+    def tree_bytes(root):
+        root = Path(root)
+        return {
+            str(path.relative_to(root)): path.read_bytes()
+            for path in root.rglob("*") if path.is_file()
+        }
 
     def write_issue(self, source="zgjsb", day="2026-08-31", issue_no="9167",
                     source_name=None, archive=None):
@@ -313,7 +332,10 @@ class WorkbenchAPITest(unittest.TestCase):
         )
         api.save_draft(self.archive, self.vault, self.valid_draft())
 
-        issue = api.get_issue(self.archive, "zgjsb", "2026-08-31")
+        issue = api.get_issue(
+            self.archive, "zgjsb", "2026-08-31",
+            require_strong_evidence=True,
+        )
 
         self.assertEqual(issue["local_pdf_date_verification"], "unverified")
         self.assertEqual(issue["status"], "needs_review")
@@ -401,7 +423,10 @@ class WorkbenchAPITest(unittest.TestCase):
         self.assertEqual(saved["status"], "draft_saved")
         self.assertTrue(Path(saved["draft_path"]).is_file())
         self.assertFalse(any(path.is_file() for path in self.vault.rglob("*")))
-        issue = api.get_issue(self.archive, "zgjsb", "2026-08-31")
+        issue = api.get_issue(
+            self.archive, "zgjsb", "2026-08-31",
+            require_strong_evidence=True,
+        )
         self.assertEqual(issue["units"][0]["summary"], self.valid_draft()["units"][0]["summary"])
         self.assertEqual(issue["units"][0]["importance"], 4)
         self.assertEqual(issue["units"][0]["title"], "人工标题：住房制度观察")
@@ -502,7 +527,13 @@ class WorkbenchAPITest(unittest.TestCase):
         }
         api.save_draft(self.archive, self.vault, fresh)
         stored = api._load_draft(self.archive, "zgjsb", "2026-08-31")
-        self.assertEqual(stored["evidence_sha256"], replaced["evidence_sha256"])
+        self.assertEqual(
+            stored["evidence_revision"], replaced["evidence_sha256"]
+        )
+        self.assertRegex(stored["evidence_sha256"], r"^[a-f0-9]{64}$")
+        self.assertNotEqual(
+            stored["evidence_sha256"], replaced["evidence_sha256"]
+        )
         self.assertEqual(stored["units"], [
             {"id": "u1", "summary": "基于新版证据重新复核"}
         ])
@@ -513,7 +544,10 @@ class WorkbenchAPITest(unittest.TestCase):
         draft = self.valid_draft()
         api.save_draft(self.archive, self.vault, draft)
 
-        issue = api.get_issue(self.archive, "zgjsb", "2026-08-31")
+        issue = api.get_issue(
+            self.archive, "zgjsb", "2026-08-31",
+            require_strong_evidence=True,
+        )
         self.assertEqual(issue["coverage"]["missing_page"], 1)
         self.assertEqual(issue["status"], "needs_review")
         dashboard = api.get_daily_dashboard(self.archive, "2026-08-31")
@@ -549,11 +583,151 @@ class WorkbenchAPITest(unittest.TestCase):
             json.dumps(legacy, ensure_ascii=False), encoding="utf-8"
         )
 
-        issue = api.get_issue(self.archive, "zgjsb", "2026-08-31")
+        issue = api.get_issue(
+            self.archive, "zgjsb", "2026-08-31",
+            require_strong_evidence=True,
+        )
 
         self.assertTrue(issue["draft_stale"])
         self.assertEqual(issue["coverage"]["with_draft"], 0)
         self.assertEqual(issue["status"], "needs_review")
+
+    def test_legacy_strong_draft_falls_back_once_and_remains_editable(self):
+        self.write_issue()
+        strong = api.get_issue(
+            self.archive, "zgjsb", "2026-08-31",
+            require_strong_evidence=True,
+        )["evidence_sha256"]
+        legacy = self.valid_draft()
+        legacy["evidence_sha256"] = strong
+        legacy.pop("evidence_revision", None)
+        legacy["saved_at"] = "2026-08-31T09:30:00+08:00"
+        original_units = json.loads(json.dumps(legacy["units"]))
+        legacy_path = api._draft_path(
+            self.archive, "zgjsb", "2026-08-31"
+        )
+        legacy_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy_path.write_text(
+            json.dumps(legacy, ensure_ascii=False), encoding="utf-8"
+        )
+        original_hash = api.vault_publisher._issue_tree_evidence_sha256
+
+        with mock.patch.object(
+                api.vault_publisher,
+                "_issue_tree_evidence_sha256",
+                wraps=original_hash,
+        ) as evidence_hash:
+            issue = api.get_issue(
+                self.archive, "zgjsb", "2026-08-31"
+            )
+            second_issue = api.get_issue(
+                self.archive, "zgjsb", "2026-08-31"
+            )
+            row = next(
+                item for item in api.get_daily_dashboard(
+                    self.archive, "2026-08-31"
+                )["newspapers"] if item["source"] == "zgjsb"
+            )
+
+        self.assertFalse(issue["draft_stale"])
+        self.assertFalse(second_issue["draft_stale"])
+        self.assertEqual(issue["status"], "ready_to_publish")
+        self.assertEqual(row["status"], "ready_to_publish")
+        evidence_hash.assert_called_once()
+        upgraded = api._load_draft(
+            self.archive, "zgjsb", "2026-08-31"
+        )
+        self.assertEqual(
+            upgraded["evidence_revision"], issue["evidence_revision"]
+        )
+        self.assertEqual(upgraded["saved_at"], legacy["saved_at"])
+        self.assertEqual(upgraded["units"], original_units)
+
+        saved = api.save_draft(self.archive, self.vault, legacy)
+        self.assertRegex(saved["evidence_revision"], r"^[a-f0-9]{64}$")
+        self.assertEqual(saved["evidence_sha256"], strong)
+
+    def test_metadata_only_issue_replacement_uses_strong_draft_fallback(self):
+        issue_dir = self.write_issue()
+        api.save_draft(self.archive, self.vault, self.valid_draft())
+        before = api.get_issue(self.archive, "zgjsb", "2026-08-31")
+        page = issue_dir / "pages" / "01.jpg"
+        payload = page.read_bytes()
+        replacement = issue_dir / "pages" / "replacement.jpg"
+        replacement.write_bytes(payload)
+        os.replace(replacement, page)
+        original_hash = api.vault_publisher._issue_tree_evidence_sha256
+
+        with mock.patch.object(
+                api.vault_publisher,
+                "_issue_tree_evidence_sha256",
+                wraps=original_hash,
+        ) as evidence_hash:
+            after = api.get_issue(
+                self.archive, "zgjsb", "2026-08-31"
+            )
+            second = api.get_issue(
+                self.archive, "zgjsb", "2026-08-31"
+            )
+
+        self.assertNotEqual(
+            before["evidence_revision"], after["evidence_revision"]
+        )
+        self.assertFalse(after["draft_stale"])
+        self.assertFalse(second["draft_stale"])
+        self.assertEqual(after["status"], "ready_to_publish")
+        evidence_hash.assert_called_once()
+        upgraded = api._load_draft(
+            self.archive, "zgjsb", "2026-08-31"
+        )
+        self.assertEqual(
+            upgraded["evidence_revision"], after["evidence_revision"]
+        )
+
+        api.save_draft(self.archive, self.vault, {
+            "source": "zgjsb",
+            "date": "2026-08-31",
+            "evidence_sha256": after["evidence_sha256"],
+            "units": [{"id": "u1", "summary": "仅更新第一版"}],
+        })
+        stored = api._load_draft(
+            self.archive, "zgjsb", "2026-08-31"
+        )
+        self.assertEqual(
+            [unit["id"] for unit in stored["units"]], ["u1", "u2"]
+        )
+        self.assertEqual(stored["units"][0]["summary"], "仅更新第一版")
+        self.assertTrue(stored["units"][1]["summary"])
+
+    def test_strong_issue_view_does_not_trust_revision_only_draft_match(self):
+        issue_dir = self.write_issue()
+        api.save_draft(self.archive, self.vault, self.valid_draft())
+        draft_path = api._draft_path(
+            self.archive, "zgjsb", "2026-08-31"
+        )
+        stored = api._load_draft(
+            self.archive, "zgjsb", "2026-08-31"
+        )
+
+        # Change payload bytes, then forge only the cheap revision hint to the
+        # new metadata.  A publish-sensitive view must still compare content.
+        (issue_dir / "pages" / "01.jpg").write_bytes(b"jpeg-two")
+        current_revision = api.vault_publisher._issue_tree_revision_sha256(
+            self.archive, "zgjsb", "2026-08-31"
+        )
+        stored["evidence_revision"] = current_revision
+        draft_path.write_text(
+            json.dumps(stored, ensure_ascii=False), encoding="utf-8"
+        )
+
+        issue = api.get_issue(
+            self.archive, "zgjsb", "2026-08-31",
+            require_strong_evidence=True,
+        )
+
+        self.assertTrue(issue["draft_stale"])
+        self.assertEqual(issue["status"], "needs_review")
+        self.assertEqual(issue["coverage"]["with_draft"], 0)
 
     def test_concurrent_incremental_draft_saves_do_not_lose_an_edition(self):
         self.write_issue()
@@ -629,10 +803,156 @@ class WorkbenchAPITest(unittest.TestCase):
         self.assertEqual(contender.exitcode, 0)
         self.assertTrue(lock_entered.is_set())
 
+    def test_normal_issue_and_overviews_do_not_wait_for_source_update(self):
+        self.write_issue()
+        archive_before = self.tree_bytes(self.archive)
+        vault_before = self.tree_bytes(self.vault)
+
+        for holder_kind in ("thread", "process"):
+            with self.subTest(holder=holder_kind):
+                errors = []
+                if holder_kind == "thread":
+                    ready = threading.Event()
+                    release = threading.Event()
+
+                    def hold_in_thread():
+                        try:
+                            _hold_publisher_evidence_lock(
+                                str(self.archive), "zgjsb", "2026-08-31",
+                                ready, release,
+                            )
+                        except BaseException as exc:  # noqa: BLE001
+                            errors.append(exc)
+
+                    holder = threading.Thread(target=hold_in_thread)
+                else:
+                    context = multiprocessing.get_context("spawn")
+                    ready = context.Event()
+                    release = context.Event()
+                    holder = context.Process(
+                        target=_hold_publisher_evidence_lock,
+                        args=(
+                            str(self.archive), "zgjsb", "2026-08-31",
+                            ready, release,
+                        ),
+                    )
+                holder.start()
+                try:
+                    self.assertTrue(
+                        ready.wait(timeout=5), "来源证据锁持有者未就绪"
+                    )
+                    started = time.monotonic()
+                    with self.assertRaises(api.SourceUpdatingError) as caught:
+                        api.get_issue(
+                            self.archive, "zgjsb", "2026-08-31"
+                        )
+                    dashboard = api.get_daily_dashboard(
+                        self.archive, "2026-08-31", source="zgjsb"
+                    )
+                    inbox = api.get_inbox(
+                        self.archive, "2026-08-31", source="zgjsb"
+                    )
+                    elapsed = time.monotonic() - started
+
+                    self.assertLess(elapsed, 1.0)
+                    self.assertEqual(caught.exception.code, "source_updating")
+                    self.assertEqual(caught.exception.source, "zgjsb")
+                    self.assertEqual(
+                        dashboard["newspapers"][0]["status"], "running"
+                    )
+                    self.assertEqual(
+                        dashboard["stats"]["updating_count"], 1
+                    )
+                    self.assertEqual(inbox["issues"][0]["status"], "running")
+                    self.assertEqual(inbox["stats"]["updating_count"], 1)
+                    self.assertEqual(self.tree_bytes(self.archive), archive_before)
+                    self.assertEqual(self.tree_bytes(self.vault), vault_before)
+                finally:
+                    release.set()
+                    holder.join(timeout=5)
+                self.assertFalse(holder.is_alive())
+                if holder_kind == "process":
+                    self.assertEqual(holder.exitcode, 0)
+                self.assertEqual(errors, [])
+
+    def test_strong_issue_and_draft_save_wait_for_source_update(self):
+        self.write_issue()
+        draft = self.valid_draft()
+        archive_before = self.tree_bytes(self.archive)
+        vault_before = self.tree_bytes(self.vault)
+        context = multiprocessing.get_context("spawn")
+        ready = context.Event()
+        release = context.Event()
+        holder = context.Process(
+            target=_hold_publisher_evidence_lock,
+            args=(
+                str(self.archive), "zgjsb", "2026-08-31", ready, release,
+            ),
+        )
+        strong_started = threading.Event()
+        strong_done = threading.Event()
+        save_started = threading.Event()
+        save_done = threading.Event()
+        results = {}
+
+        def load_strong():
+            strong_started.set()
+            try:
+                results["strong"] = api.get_issue(
+                    self.archive, "zgjsb", "2026-08-31",
+                    require_strong_evidence=True,
+                )
+            except BaseException as exc:  # noqa: BLE001
+                results["strong_error"] = exc
+            finally:
+                strong_done.set()
+
+        def save():
+            save_started.set()
+            try:
+                results["save"] = api.save_draft(
+                    self.archive, self.vault, draft
+                )
+            except BaseException as exc:  # noqa: BLE001
+                results["save_error"] = exc
+            finally:
+                save_done.set()
+
+        holder.start()
+        strong_thread = threading.Thread(target=load_strong)
+        save_thread = threading.Thread(target=save)
+        try:
+            self.assertTrue(ready.wait(timeout=5))
+            strong_thread.start()
+            save_thread.start()
+            self.assertTrue(strong_started.wait(timeout=2))
+            self.assertTrue(save_started.wait(timeout=2))
+            self.assertFalse(strong_done.wait(timeout=0.25))
+            self.assertFalse(save_done.is_set())
+            self.assertEqual(self.tree_bytes(self.archive), archive_before)
+            self.assertEqual(self.tree_bytes(self.vault), vault_before)
+        finally:
+            release.set()
+        strong_thread.join(timeout=5)
+        save_thread.join(timeout=5)
+        holder.join(timeout=5)
+        self.assertFalse(strong_thread.is_alive())
+        self.assertFalse(save_thread.is_alive())
+        self.assertFalse(holder.is_alive())
+        self.assertEqual(holder.exitcode, 0)
+        self.assertNotIn("strong_error", results)
+        self.assertNotIn("save_error", results)
+        self.assertIn("strong", results)
+        self.assertEqual(results["save"]["status"], "draft_saved")
+        self.assertEqual(self.tree_bytes(self.vault), vault_before)
+
     def test_concurrent_save_rejects_old_draft_plan_creation_and_apply(self):
         self.write_issue()
         api.save_draft(self.archive, self.vault, self.valid_draft())
-        issue = api.get_issue(self.archive, "zgjsb", "2026-08-31")
+        issue = api.get_issue(
+            self.archive, "zgjsb", "2026-08-31",
+            require_strong_evidence=True,
+        )
         old_draft = api._load_draft(
             self.archive, "zgjsb", "2026-08-31"
         )
@@ -695,7 +1015,10 @@ class WorkbenchAPITest(unittest.TestCase):
     def test_published_status_tracks_current_draft_digest_and_recovers_after_republish(self):
         self.write_issue()
         api.save_draft(self.archive, self.vault, self.valid_draft())
-        issue = api.get_issue(self.archive, "zgjsb", "2026-08-31")
+        issue = api.get_issue(
+            self.archive, "zgjsb", "2026-08-31",
+            require_strong_evidence=True,
+        )
         first_draft = api._load_draft(self.archive, "zgjsb", "2026-08-31")
         first_plan = api.vault_publisher.create_plan(
             self.archive, self.vault, issue, first_draft
@@ -733,7 +1056,10 @@ class WorkbenchAPITest(unittest.TestCase):
         self.assertEqual(inbox_pending["status"], "ready_to_publish")
         self.assertEqual(inbox_pending["publish_status"], "pending")
 
-        current_issue = api.get_issue(self.archive, "zgjsb", "2026-08-31")
+        current_issue = api.get_issue(
+            self.archive, "zgjsb", "2026-08-31",
+            require_strong_evidence=True,
+        )
         current_draft = api._load_draft(self.archive, "zgjsb", "2026-08-31")
         second_plan = api.vault_publisher.create_plan(
             self.archive, self.vault, current_issue, current_draft
@@ -773,7 +1099,10 @@ class WorkbenchAPITest(unittest.TestCase):
     def test_overview_detects_published_page_tamper_even_with_mtime_rollback(self):
         issue_dir = self.write_issue()
         api.save_draft(self.archive, self.vault, self.valid_draft())
-        issue = api.get_issue(self.archive, "zgjsb", "2026-08-31")
+        issue = api.get_issue(
+            self.archive, "zgjsb", "2026-08-31",
+            require_strong_evidence=True,
+        )
         state_path = self.archive / "_state" / "zgjsb" / "2026-08-31.json"
         state_path.parent.mkdir(parents=True)
         state_path.write_text(json.dumps({
@@ -937,6 +1266,35 @@ class WorkbenchAPITest(unittest.TestCase):
         ok = next(x for x in result["issues"] if x["source"] == "zgjsb")
         self.assertEqual(ok["text_length"], 23)
 
+    def test_inbox_isolates_legacy_invalid_source_directories(self):
+        self.write_issue()
+        for legacy_source in ("ABC", "foo.bar"):
+            issue_dir = self.archive / legacy_source / "2026-08-31"
+            issue_dir.mkdir(parents=True)
+            (issue_dir / "issue.json").write_text(
+                json.dumps({
+                    "source": legacy_source,
+                    "date": "2026-08-31",
+                }),
+                encoding="utf-8",
+            )
+
+        result = api.get_inbox(self.archive, day="2026-08-31")
+
+        valid = next(
+            row for row in result["issues"] if row["source"] == "zgjsb"
+        )
+        self.assertNotEqual(valid["status"], "failed")
+        for legacy_source in ("ABC", "foo.bar"):
+            row = next(
+                item for item in result["issues"]
+                if item["source"] == legacy_source
+            )
+            self.assertEqual(row["status"], "failed")
+            self.assertEqual(row["publish_status"], "blocked")
+            self.assertEqual(row["text_length"], 0)
+            self.assertTrue(row["warnings"])
+
     def test_inbox_and_dashboard_use_lightweight_issue_overview(self):
         self.write_issue(source="zgjsb", source_name="中国建设报", issue_no="9167")
 
@@ -966,20 +1324,48 @@ class WorkbenchAPITest(unittest.TestCase):
             str(self.archive / "zgjsb" / "2026-08-31" / "pages" / "01.jpg"),
         )
 
-    def test_full_issue_path_still_uses_strong_evidence_hash(self):
+    def test_inbox_ignores_internal_pipeline_snapshot_directories(self):
+        snapshot = self.archive / "zgjsb" / ".2026-08-31.pipeline.deadbeef"
+        snapshot.mkdir(parents=True)
+        (snapshot / "issue.json").write_text(
+            json.dumps({"source": "zgjsb", "date": "2026-08-31"}),
+            encoding="utf-8",
+        )
+
+        inbox = api.get_inbox(self.archive)
+
+        self.assertEqual(inbox["issues"], [])
+
+    def test_issue_navigation_skips_full_hash_but_draft_save_uses_it(self):
         self.write_issue()
-        original = api.vault_publisher._issue_tree_evidence_sha256
+        original_hash = api.vault_publisher._issue_tree_evidence_sha256
+        original_revision = api.vault_publisher._issue_tree_revision_sha256
 
         with mock.patch.object(
                 api.vault_publisher,
                 "_issue_tree_evidence_sha256",
-                wraps=original,
-        ) as evidence_hash:
+                wraps=original_hash,
+        ) as evidence_hash, mock.patch.object(
+                api.vault_publisher,
+                "_issue_tree_revision_sha256",
+                wraps=original_revision,
+        ) as evidence_revision:
             result = api.get_issue(self.archive, "zgjsb", "2026-08-31")
+            self.assertRegex(result["evidence_sha256"], r"^[a-f0-9]{64}$")
+            self.assertEqual(
+                result["evidence_sha256"], result["evidence_revision"]
+            )
+            self.assertEqual(result["evidence_kind"], "metadata_revision_v1")
+            evidence_hash.assert_not_called()
+            self.assertGreaterEqual(evidence_revision.call_count, 1)
 
-        self.assertRegex(result["evidence_sha256"], r"^[a-f0-9]{64}$")
-        evidence_hash.assert_called_once_with(
-            self.archive, "zgjsb", "2026-08-31"
+            saved = api.save_draft(
+                self.archive, self.vault, self.valid_draft()
+            )
+
+        self.assertEqual(evidence_hash.call_count, 1)
+        self.assertNotEqual(
+            saved["evidence_sha256"], saved["evidence_revision"]
         )
 
     def test_non_import_api_startup_does_not_load_local_pdf_network_stack(self):
@@ -1572,7 +1958,10 @@ print(json.dumps(sorted(
         )
 
         api.save_draft(self.archive, self.vault, self.valid_draft())
-        current = api.get_issue(self.archive, "zgjsb", "2026-08-31")
+        current = api.get_issue(
+            self.archive, "zgjsb", "2026-08-31",
+            require_strong_evidence=True,
+        )
         state_path = self.archive / "_state" / "zgjsb" / "2026-08-31.json"
         state_path.parent.mkdir(parents=True)
         state_path.write_text(json.dumps({
@@ -1592,8 +1981,11 @@ print(json.dumps(sorted(
         os.utime(pdf, ns=(original.st_atime_ns, original.st_mtime_ns))
 
         with self.assertRaisesRegex(
-                api.ValidationError, "证据目录无法完整校验"):
-            api.get_issue(self.archive, "zgjsb", "2026-08-31")
+                api.ValidationError, "证据目录无法"):
+            api.get_issue(
+                self.archive, "zgjsb", "2026-08-31",
+                require_strong_evidence=True,
+            )
         after = next(
             row for row in api.get_daily_dashboard(
                 self.archive, "2026-08-31"
@@ -1618,10 +2010,16 @@ print(json.dumps(sorted(
         )
         legacy_evidence = _legacy_issue_tree_evidence(issue_dir)
 
-        issue = api.get_issue(self.archive, "zgjsb", "2026-08-31")
+        issue = api.get_issue(
+            self.archive, "zgjsb", "2026-08-31",
+            require_strong_evidence=True,
+        )
         self.assertEqual(issue["evidence_sha256"], legacy_evidence)
         api.save_draft(self.archive, self.vault, self.valid_draft())
-        current = api.get_issue(self.archive, "zgjsb", "2026-08-31")
+        current = api.get_issue(
+            self.archive, "zgjsb", "2026-08-31",
+            require_strong_evidence=True,
+        )
         state_path = self.archive / "_state" / "zgjsb" / "2026-08-31.json"
         state_path.parent.mkdir(parents=True)
         state_path.write_text(json.dumps({
@@ -1656,8 +2054,11 @@ print(json.dumps(sorted(
         pdf.write_bytes(b"%PDF-1.4\nTAMPERED\n%%EOF")
 
         with self.assertRaisesRegex(
-                api.ValidationError, "证据目录无法完整校验"):
-            api.get_issue(self.archive, "zgjsb", "2026-08-31")
+                api.ValidationError, "证据目录无法"):
+            api.get_issue(
+                self.archive, "zgjsb", "2026-08-31",
+                require_strong_evidence=True,
+            )
 
     def test_local_pdf_accepts_case_alias_of_same_archive_inode(self):
         alias = self.archive.with_name(self.archive.name.upper())
@@ -1683,7 +2084,10 @@ print(json.dumps(sorted(
             json.dumps(raw, ensure_ascii=False), encoding="utf-8"
         )
 
-        issue = api.get_issue(self.archive, "zgjsb", "2026-08-31")
+        issue = api.get_issue(
+            self.archive, "zgjsb", "2026-08-31",
+            require_strong_evidence=True,
+        )
 
         self.assertRegex(issue["evidence_sha256"], r"^[a-f0-9]{64}$")
         self.assertEqual(issue["pdf_path"], str(pdf))
@@ -1705,8 +2109,11 @@ print(json.dumps(sorted(
         )
 
         with self.assertRaisesRegex(
-                api.ValidationError, "证据目录无法完整校验"):
-            api.get_issue(self.archive, "zgjsb", "2026-08-31")
+                api.ValidationError, "证据目录无法"):
+            api.get_issue(
+                self.archive, "zgjsb", "2026-08-31",
+                require_strong_evidence=True,
+            )
 
     def test_local_pdf_rejects_symlink_archive_alias(self):
         issue_dir = self.write_issue()
@@ -1728,8 +2135,11 @@ print(json.dumps(sorted(
         )
 
         with self.assertRaisesRegex(
-                api.ValidationError, "证据目录无法完整校验"):
-            api.get_issue(self.archive, "zgjsb", "2026-08-31")
+                api.ValidationError, "证据目录无法"):
+            api.get_issue(
+                self.archive, "zgjsb", "2026-08-31",
+                require_strong_evidence=True,
+            )
 
     def test_local_pdf_evidence_rejects_escape_missing_and_symlink(self):
         issue_dir = self.write_issue()
@@ -1755,8 +2165,11 @@ print(json.dumps(sorted(
                 json.dumps(raw, ensure_ascii=False), encoding="utf-8"
             )
             with self.subTest(case=name), self.assertRaisesRegex(
-                    api.ValidationError, "证据目录无法完整校验"):
-                api.get_issue(self.archive, "zgjsb", "2026-08-31")
+                    api.ValidationError, "证据目录无法"):
+                api.get_issue(
+                    self.archive, "zgjsb", "2026-08-31",
+                    require_strong_evidence=True,
+                )
 
     def test_reading_activity_rejects_invalid_source_status_and_missing_completion(self):
         with self.assertRaises(api.ValidationError):
@@ -2078,7 +2491,9 @@ print(json.dumps(sorted(
         self.assertEqual(dashboard_proc.returncode, 0, dashboard_proc.stderr)
         self.assertEqual(len(dashboard_payload["data"]["newspapers"]), 8)
 
-        fetch_args = argparse.Namespace(date=None, source=None, stage=None, offline=False)
+        fetch_args = argparse.Namespace(
+            date=None, source=None, stage=None, offline=False, workers=3
+        )
         reader_args = argparse.Namespace(cmd="prepare", date="2026-09-02", entity=None)
         with mock.patch.object(cli.subprocess, "run") as run_mock:
             run_mock.return_value.returncode = 0
@@ -2087,6 +2502,7 @@ print(json.dumps(sorted(
             self.assertEqual(fetch_cmd[:2], [sys.executable, cli.FETCHER])
             self.assertIn("--registry", fetch_cmd)
             self.assertIn(cli.REGISTRY, fetch_cmd)
+            self.assertEqual(fetch_cmd[-2:], ["--workers", "3"])
         with mock.patch.object(cli, "run", return_value=0) as reader_run:
             cli.cmd_reader(reader_args)
             self.assertEqual(reader_run.call_args.args[1], "prepare")

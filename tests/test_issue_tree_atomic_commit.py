@@ -140,6 +140,30 @@ class AtomicIssueTreeCommitTests(unittest.TestCase):
         self.assertEqual(tree_snapshot(self.target), self.before)
         self.assert_no_transaction_artifacts()
 
+    def test_commit_and_recovery_double_failure_is_typed_batch_fatal(self):
+        real_rename = lib.ArchiveSession.rename
+
+        def fail_commit_and_restore(session, source, destination):
+            source_name = Path(source).name
+            destination_name = Path(destination).name
+            if ".staging." in source_name and destination_name == self.target.name:
+                raise OSError("commit rename failed")
+            if ".previous." in source_name and destination_name == self.target.name:
+                raise lib.ArchiveConflictError("backup restore identity changed")
+            return real_rename(session, source, destination)
+
+        with mock.patch.object(
+                lib.ArchiveSession, "rename",
+                new=fail_commit_and_restore,
+        ):
+            with self.assertRaises(lib.ArchiveTransactionError) as caught:
+                lib.commit_issue_tree(str(self.target), self.files, self.issue)
+
+        self.assertIsInstance(caught.exception.__cause__, lib.ArchiveConflictError)
+        self.assertIn(
+            lib.ArchiveTransactionError, lib.ARCHIVE_FATAL_EXCEPTIONS
+        )
+
     def test_parent_fsync_failure_after_old_move_restores_old_tree(self):
         real_fsync_directory = lib.fsync_directory
         parent_syncs = 0
@@ -229,7 +253,7 @@ class AtomicIssueTreeCommitTests(unittest.TestCase):
             lib, "fsync_directory", side_effect=fail_live_parent
         ):
             with self.assertRaisesRegex(
-                OSError, "persistent parent fsync failure"
+                lib.ArchiveTransactionError, "耐久清理未完成"
             ):
                 lib.commit_issue_tree(str(self.target), self.files, self.issue)
 

@@ -18,7 +18,6 @@ import json
 import os
 import re
 import sys
-import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -95,26 +94,14 @@ def _api(src, path, data):
         "Referer": src.get("entry") or base,
     }
     try:
-        import requests
-
-        response = requests.post(url, json=data, timeout=20, headers=headers)
-        if response.status_code != 200:
-            return None
-        return response.json()
-    except ImportError:
-        request = urllib.request.Request(
-            url,
-            data=json.dumps(data, ensure_ascii=False).encode("utf-8"),
-            headers=headers,
-            method="POST",
+        status, _final_url, raw = lib.http_post_json(
+            url, data, headers=headers, timeout=20
         )
-        try:
-            with urllib.request.urlopen(request, timeout=20) as response:
-                if response.status != 200:
-                    return None
-                return json.loads(response.read().decode("utf-8"))
-        except Exception:  # noqa: BLE001
+        if status != 200:
             return None
+        return json.loads(raw.decode("utf-8-sig"))
+    except lib.PIPELINE_FATAL_EXCEPTIONS:
+        raise
     except Exception:  # noqa: BLE001
         return None
 
@@ -186,6 +173,8 @@ def fetch(src, d, archive_root):
             st, final_url, raw = lib.http_get(
                 page_img, referer=src.get("entry")
             )
+        except lib.PIPELINE_FATAL_EXCEPTIONS:
+            raise
         except Exception as exc:  # noqa: BLE001
             return None, "第%s版版面图下载异常：%s；整期未归档" % (no, exc)
         if st != 200:
@@ -230,6 +219,8 @@ def fetch(src, d, archive_root):
              "units": units, "fetched_at": datetime.datetime.now().isoformat(timespec="seconds")}
     try:
         lib.commit_issue_tree(aps["dir"], page_downloads, issue)
+    except lib.PIPELINE_FATAL_EXCEPTIONS:
+        raise
     except Exception as exc:  # noqa: BLE001
         return None, "整期归档事务失败：%s" % exc
     return issue, None
@@ -260,6 +251,8 @@ def parse(src, d, archive_root):
         try:
             r = _api(src, "/uv/article/article/editionId",
                      {"id": u.get("api_id"), "period_id": u.get("period_id")})
+        except lib.PIPELINE_FATAL_EXCEPTIONS:
+            raise
         except Exception as exc:  # noqa: BLE001
             return issue, "第%s版文章列表请求异常：%s" % (unit_index, exc)
         if not isinstance(r, dict) or not r:
@@ -292,6 +285,8 @@ def parse(src, d, archive_root):
             # 才是本适配器可确认的权威全文来源，因此每篇都必须请求。
             try:
                 ra = _api(src, "/uv/article/article/articleId", {"id": aid})
+            except lib.PIPELINE_FATAL_EXCEPTIONS:
+                raise
             except Exception as exc:  # noqa: BLE001
                 return issue, "第%s版第%s篇全文请求异常：%s" % (
                     unit_index, article_index, exc

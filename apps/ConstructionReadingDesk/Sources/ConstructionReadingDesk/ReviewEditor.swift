@@ -104,7 +104,7 @@ private struct EvidenceWorkspace: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
+            LazyVStack(alignment: .leading, spacing: 16) {
                 HStack(alignment: .firstTextBaseline) {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("第\(edition.pageNumber ?? 0)版 · \(edition.title)")
@@ -130,7 +130,12 @@ private struct EvidenceWorkspace: View {
                     }
                 }
 
-                OCRProofreadingCard(draft: draft, warnings: issue.warnings, viewModel: viewModel)
+                OCRProofreadingCard(
+                    editionID: edition.id,
+                    draft: draft,
+                    warnings: issue.warnings,
+                    viewModel: viewModel
+                )
             }
             .padding(.leading, 20)
             .padding(.trailing, 12)
@@ -141,31 +146,24 @@ private struct EvidenceWorkspace: View {
 }
 
 private struct OCRProofreadingCard: View {
+    let editionID: String
     let draft: ArticleDraft
     let warnings: [String]
     @ObservedObject var viewModel: ReadingDeskViewModel
 
-    private var layout: OCRDocumentLayout { OCRDocumentLayout(text: draft.ocrText) }
-
-    private var displayBlocks: [OCRContentBlock] {
-        if !draft.ocrBlocks.isEmpty { return draft.ocrBlocks }
-        return layout.paragraphs.map {
-            OCRContentBlock(kind: "paragraph", text: $0.lines.joined(separator: "\n"))
-        }
-    }
-
     var body: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 16) {
-                VStack(alignment: .leading, spacing: 12) {
+                LazyVStack(alignment: .leading, spacing: 12) {
                     Label("原始 OCR（只读）", systemImage: "lock.fill")
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(.secondary)
-                    if displayBlocks.isEmpty {
+                    if draft.ocrBlocks.isEmpty {
                         Text("当前版次没有可用 OCR 原文。")
                             .foregroundStyle(.secondary)
                     } else {
-                        ForEach(Array(displayBlocks.enumerated()), id: \.offset) { index, block in
+                        ForEach(draft.ocrBlocks.indices, id: \.self) { index in
+                            let block = draft.ocrBlocks[index]
                             VStack(alignment: .leading, spacing: 6) {
                                 if let title = block.title, !title.isEmpty {
                                     Text(title)
@@ -177,12 +175,8 @@ private struct OCRProofreadingCard: View {
                                     .fixedSize(horizontal: false, vertical: true)
                             }
                             .padding(.bottom, 8)
-                            .accessibilityElement(children: .combine)
-                            .accessibilityLabel(
-                                "OCR 结构块 \(index + 1)，\(block.kind == "article" ? "文章" : "段落")"
-                                + (block.title.map { "，标题 \($0)" } ?? "")
-                                + "，\(block.text)"
-                            )
+                            .accessibilityElement(children: .contain)
+                            .accessibilityHint("OCR 结构块 \(index + 1)，\(block.kind == "article" ? "文章" : "段落")")
                         }
                     }
                 }
@@ -203,7 +197,9 @@ private struct OCRProofreadingCard: View {
                     Spacer()
                     Picker("校对状态", selection: Binding(
                         get: { viewModel.editorState?.draft.ocrReviewStatus ?? .unreviewed },
-                        set: viewModel.setOCRReviewStatus
+                        set: { value in
+                            viewModel.setOCRReviewStatus(value, expectedEditionID: editionID)
+                        }
                     )) {
                         ForEach(OCRReviewStatus.allCases) { status in
                             Label(status.label, systemImage: status.symbolName).tag(status)
@@ -211,13 +207,17 @@ private struct OCRProofreadingCard: View {
                     }
                     .frame(width: 180)
                     .accessibilityLabel("OCR 校对状态")
-                    Button("恢复原文") { viewModel.restoreOriginalOCR() }
+                    Button("恢复原文") {
+                        viewModel.restoreOriginalOCR(expectedEditionID: editionID)
+                    }
                         .disabled(draft.proofreadText == draft.ocrText)
                 }
 
                 TextEditor(text: Binding(
                     get: { viewModel.editorState?.draft.proofreadText ?? "" },
-                    set: viewModel.updateProofreadText
+                    set: { value in
+                        viewModel.updateProofreadText(value, expectedEditionID: editionID)
+                    }
                 ))
                 .font(.body)
                 .lineSpacing(4)
@@ -259,7 +259,11 @@ private struct OCRProofreadingCard: View {
                 Label("疑点记录", systemImage: "questionmark.bubble")
                     .font(.subheadline.weight(.semibold))
                 Spacer()
-                Button { viewModel.addOCRSuspicion() } label: { Label("添加疑点", systemImage: "plus") }
+                Button {
+                    viewModel.addOCRSuspicion(expectedEditionID: editionID)
+                } label: {
+                    Label("添加疑点", systemImage: "plus")
+                }
             }
             ForEach(Array(draft.ocrSuspicions.indices), id: \.self) { index in
                 HStack {
@@ -269,9 +273,17 @@ private struct OCRProofreadingCard: View {
                                   values.indices.contains(index) else { return "" }
                             return values[index]
                         },
-                        set: { viewModel.updateOCRSuspicion(at: index, value: $0) }
+                        set: {
+                            viewModel.updateOCRSuspicion(
+                                at: index,
+                                value: $0,
+                                expectedEditionID: editionID
+                            )
+                        }
                     ))
-                    Button(role: .destructive) { viewModel.removeOCRSuspicion(at: index) } label: {
+                    Button(role: .destructive) {
+                        viewModel.removeOCRSuspicion(at: index, expectedEditionID: editionID)
+                    } label: {
                         Image(systemName: "trash")
                     }
                     .accessibilityLabel("删除第 \(index + 1) 条 OCR 疑点")
@@ -306,6 +318,7 @@ private struct SummaryWorkspace: View {
                 factEditor
                 importanceEditor
                 readingActions
+                    .disabled(viewModel.isEditorialBusy)
                 publishingActions
             }
             .padding(.leading, 12)
@@ -320,13 +333,17 @@ private struct SummaryWorkspace: View {
             VStack(alignment: .leading, spacing: 10) {
                 TextField("中文标题", text: Binding(
                     get: { viewModel.editorState?.draft.title ?? "" },
-                    set: viewModel.updateTitle
+                    set: { value in
+                        viewModel.updateTitle(value, expectedEditionID: edition.id)
+                    }
                 ))
                 .textFieldStyle(.roundedBorder)
                 .accessibilityLabel("知识卡片中文标题")
                 TextEditor(text: Binding(
                     get: { viewModel.editorState?.draft.summary ?? "" },
-                    set: viewModel.updateSummary
+                    set: { value in
+                        viewModel.updateSummary(value, expectedEditionID: edition.id)
+                    }
                 ))
                 .frame(minHeight: 150)
                 .padding(7)
@@ -348,7 +365,9 @@ private struct SummaryWorkspace: View {
         GroupBox {
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 8)], alignment: .leading, spacing: 8) {
                 ForEach(ReadingTopic.allCases) { topic in
-                    Button { viewModel.toggleTopic(topic) } label: {
+                    Button {
+                        viewModel.toggleTopic(topic, expectedEditionID: edition.id)
+                    } label: {
                         Label(topic.rawValue, systemImage: draft.topics.contains(topic) ? "checkmark.circle.fill" : "circle")
                             .font(.caption.weight(.medium))
                             .foregroundStyle(draft.topics.contains(topic) ? ReadingDeskTheme.accentText : .primary)
@@ -371,7 +390,9 @@ private struct SummaryWorkspace: View {
                         HStack {
                             Text("事实 \(index + 1)").font(.caption.weight(.semibold))
                             Spacer()
-                            Button(role: .destructive) { viewModel.removeFact(at: index) } label: {
+                            Button(role: .destructive) {
+                                viewModel.removeFact(at: index, expectedEditionID: edition.id)
+                            } label: {
                                 Image(systemName: "trash")
                             }
                             .accessibilityLabel("删除第 \(index + 1) 条事实")
@@ -388,7 +409,11 @@ private struct SummaryWorkspace: View {
                     }
                     .readingDeskCard(padding: 10, cool: true)
                 }
-                Button { viewModel.addFact() } label: { Label("添加事实", systemImage: "plus.circle") }
+                Button {
+                    viewModel.addFact(expectedEditionID: edition.id)
+                } label: {
+                    Label("添加事实", systemImage: "plus.circle")
+                }
                     .frame(minHeight: 44)
             }
         } label: { Label("事实字段", systemImage: "checklist") }
@@ -405,7 +430,14 @@ private struct SummaryWorkspace: View {
                       facts.indices.contains(index) else { return "" }
                 return facts[index][keyPath: keyPath]
             },
-            set: { viewModel.updateFact(at: index, keyPath, value: $0) }
+            set: {
+                viewModel.updateFact(
+                    at: index,
+                    keyPath,
+                    value: $0,
+                    expectedEditionID: edition.id
+                )
+            }
         ))
         .textFieldStyle(.roundedBorder)
         .accessibilityLabel("事实 \(index + 1) \(label)")
@@ -415,7 +447,9 @@ private struct SummaryWorkspace: View {
         GroupBox {
             Picker("重要性", selection: Binding(
                 get: { viewModel.editorState?.draft.importance ?? 3 },
-                set: viewModel.setImportance
+                set: { value in
+                    viewModel.setImportance(value, expectedEditionID: edition.id)
+                }
             )) {
                 ForEach(1...5, id: \.self) { value in Text("\(value)").tag(value) }
             }
@@ -460,7 +494,7 @@ private struct SummaryWorkspace: View {
                         .frame(maxWidth: .infinity)
                 }
                 .frame(minHeight: 44)
-                .disabled(viewModel.isBusy || !viewModel.hasUnsavedChanges)
+                .disabled(viewModel.isEditorialBusy || !viewModel.hasUnsavedChanges)
 
                 Button { viewModel.previewPublish() } label: {
                     Label("预览发布", systemImage: "doc.text.magnifyingglass")
@@ -469,7 +503,7 @@ private struct SummaryWorkspace: View {
                 .buttonStyle(.borderedProminent)
                 .tint(ReadingDeskTheme.accent)
                 .frame(minHeight: 44)
-                .disabled(viewModel.isBusy || !viewModel.canPublishSelectedIssue)
+                .disabled(viewModel.isEditorialBusy || !viewModel.canPublishSelectedIssue)
 
                 Text(viewModel.canPublishSelectedIssue
                      ? "仅在确认差异后由 Python 后端写入 Obsidian。"
@@ -677,8 +711,7 @@ private struct BannerArtwork: View {
 
     var body: some View {
         GeometryReader { proxy in
-            if let url = ReadDailyResource.url(forResource: name, withExtension: "svg"),
-               let image = NSImage(contentsOf: url) {
+            if let image = ReadDailyResource.image(forResource: name, withExtension: "svg") {
                 Image(nsImage: image)
                     .resizable()
                     .scaledToFill()
