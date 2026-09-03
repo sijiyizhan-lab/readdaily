@@ -105,9 +105,10 @@ struct ReadingDeskRootView: View {
     @ToolbarContentBuilder
     private var toolbar: some ToolbarContent {
         ToolbarItemGroup(placement: .primaryAction) {
-            if viewModel.isBusy {
-                ProgressView().controlSize(.small).help(viewModel.operationTitle)
-                    .accessibilityLabel(viewModel.operationTitle)
+            if viewModel.isBusy || viewModel.isIssueLoading {
+                let title = viewModel.isBusy ? viewModel.operationTitle : viewModel.issueLoadTitle
+                ProgressView().controlSize(.small).help(title)
+                    .accessibilityLabel(title)
             }
             Button { viewModel.refresh() } label: { Label("刷新", systemImage: "arrow.clockwise") }
                 .labelStyle(.iconOnly)
@@ -195,8 +196,8 @@ private struct DailyInboxSidebar: View {
                         Text("本地读报 · 证据可追溯").font(.caption).foregroundStyle(.secondary)
                     }
                     Spacer()
-                    if let day = viewModel.dashboardDay {
-                        Text("\(day.readCount)/8 已读")
+                    if viewModel.dashboardDay != nil {
+                        Text("\(viewModel.displayedReadCount)/8 已读")
                             .font(.caption.monospacedDigit().weight(.semibold))
                             .foregroundStyle(ReadingDeskTheme.accentText)
                     }
@@ -218,7 +219,10 @@ private struct DailyInboxSidebar: View {
                                     ForEach(section.entries) { entry in
                                         DailyPaperRow(
                                             entry: entry,
-                                            isSelected: entry.issue?.stableID == viewModel.selectedIssueID
+                                            isSelected: entry.issue?.stableID == viewModel.selectedIssueID,
+                                            isLoading: viewModel.isIssueLoading
+                                                && entry.issue?.stableID == viewModel.selectedIssueID,
+                                            readingStatus: viewModel.displayedReadingStatus(for: entry)
                                         ) {
                                             if let issue = entry.issue { viewModel.selectIssue(issue.stableID) }
                                         }
@@ -234,10 +238,12 @@ private struct DailyInboxSidebar: View {
                     .padding(.bottom, 8)
                 }
 
-                if viewModel.isBusy {
+                if viewModel.isBusy || viewModel.isIssueLoading {
                     HStack(spacing: 9) {
                         ProgressView().controlSize(.small)
-                        Text(viewModel.operationTitle).font(.caption).foregroundStyle(.secondary)
+                        Text(viewModel.isBusy ? viewModel.operationTitle : viewModel.issueLoadTitle)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                     .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
                     .readingDeskCard(padding: 10, cool: true)
@@ -279,6 +285,8 @@ private struct DailyInboxSidebar: View {
 private struct DailyPaperRow: View {
     let entry: DailyNewspaperEntry
     let isSelected: Bool
+    let isLoading: Bool
+    let readingStatus: ReadingCompletionStatus
     let action: () -> Void
 
     var body: some View {
@@ -289,14 +297,18 @@ private struct DailyPaperRow: View {
                     HStack {
                         Text(entry.source.name).font(.body.weight(.semibold))
                         Spacer()
-                        Image(systemName: entry.readingStatus.symbolName).foregroundStyle(readingColor)
+                        if isLoading {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Image(systemName: readingStatus.symbolName).foregroundStyle(readingColor)
+                        }
                     }
                     Text(entry.status.accessibleLabel).font(.caption).foregroundStyle(.secondary)
                     Label {
-                        Text(entry.readingStatus.accessibleLabel)
+                        Text(readingStatus.accessibleLabel)
                             .foregroundStyle(.primary)
                     } icon: {
-                        Image(systemName: entry.readingStatus.symbolName)
+                        Image(systemName: readingStatus.symbolName)
                             .foregroundStyle(readingColor)
                     }
                     .font(.caption2.weight(.medium))
@@ -311,7 +323,7 @@ private struct DailyPaperRow: View {
         .buttonStyle(.plain)
         .disabled(entry.issue == nil)
         .opacity(entry.issue == nil ? 0.72 : 1)
-        .accessibilityLabel("\(entry.source.name)，\(entry.status.accessibleLabel)，\(entry.readingStatus.accessibleLabel)")
+        .accessibilityLabel("\(entry.source.name)，\(entry.status.accessibleLabel)，\(readingStatus.accessibleLabel)")
         .accessibilityValue(isSelected ? "已选择" : "未选择")
     }
 
@@ -326,7 +338,7 @@ private struct DailyPaperRow: View {
     }
 
     private var readingColor: Color {
-        switch entry.readingStatus {
+        switch readingStatus {
         case .completed: return ReadingDeskTheme.statusPositive
         case .opened: return ReadingDeskTheme.statusAttention
         case .unread: return .secondary
@@ -374,9 +386,24 @@ private struct EditionColumn: View {
                             }
                         }
                     }
+                } else if viewModel.isIssueLoading {
+                    VStack(spacing: 12) {
+                        ProgressView().controlSize(.regular)
+                        Text("正在读取报纸").font(.headline)
+                        Text(viewModel.selectedIssue?.sourceName ?? "请稍候…")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .padding(24)
+                    .readingDeskCard(cool: true)
                 } else {
-                    EmptyState(title: "选择一份报纸", detail: "从左侧日期和分类中选择已有期次。", symbol: "newspaper")
-                        .readingDeskCard(cool: true)
+                    EmptyState(
+                        title: "选择一份报纸",
+                        detail: "从左侧日期和分类中选择已有期次。",
+                        symbol: "newspaper"
+                    )
+                    .readingDeskCard(cool: true)
                 }
             }
             .padding(12)

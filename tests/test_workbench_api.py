@@ -1,5 +1,7 @@
 import argparse
+import hashlib
 import importlib.util
+import io
 import json
 import multiprocessing
 import os
@@ -28,6 +30,32 @@ def load_module(name, path):
 
 api = load_module("workbench_api", READER_SCRIPTS / "workbench_api.py")
 cli = load_module("readdaily_cli", ROOT / "scripts" / "readdaily.py")
+
+
+def local_pdf_module():
+    return api._load_local_pdf()
+
+
+def _legacy_issue_tree_evidence(issue_dir):
+    """Reproduce the established v1 issue-tree digest for compatibility."""
+    digest = hashlib.sha256()
+    digest.update(b"readdaily-publish-evidence-v1\0")
+    for current, directories, filenames in os.walk(
+            str(issue_dir), topdown=True, followlinks=False):
+        directories.sort()
+        filenames.sort()
+        for filename in filenames:
+            path = Path(current) / filename
+            relative = os.path.relpath(
+                str(path), str(issue_dir)
+            ).replace(os.sep, "/")
+            raw = path.read_bytes()
+            relative_bytes = relative.encode("utf-8")
+            digest.update(len(relative_bytes).to_bytes(8, "big"))
+            digest.update(relative_bytes)
+            digest.update(len(raw).to_bytes(8, "big"))
+            digest.update(raw)
+    return digest.hexdigest()
 
 
 def _synchronized_atomic_writer(barrier):
@@ -277,6 +305,7 @@ class WorkbenchAPITest(unittest.TestCase):
         linked_pdf.write_bytes(b"%PDF-1.4\nfixture\n")
         raw["channel"] = "local_pdf"
         raw["files"] = {"local_pdf": str(linked_pdf)}
+        raw["source_sha256"] = hashlib.sha256(linked_pdf.read_bytes()).hexdigest()
         raw["local_pdf_header_date"] = None
         raw["local_pdf_date_verification"] = "unverified"
         (issue_dir / "issue.json").write_text(
@@ -720,6 +749,70 @@ class WorkbenchAPITest(unittest.TestCase):
         self.assertEqual(republished["status"], "published")
         self.assertEqual(republished["publish_status"], "published")
 
+    def test_overview_rejects_well_formed_but_wrong_draft_evidence(self):
+        self.write_issue()
+        draft = self.valid_draft()
+        self.assertNotEqual(draft["evidence_sha256"], "0" * 64)
+        draft["evidence_sha256"] = "0" * 64
+        path = api._draft_path(self.archive, "zgjsb", "2026-08-31")
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(draft, ensure_ascii=False), encoding="utf-8")
+
+        row = next(
+            item for item in api.get_daily_dashboard(
+                self.archive, "2026-08-31"
+            )["newspapers"] if item["source"] == "zgjsb"
+        )
+
+        self.assertEqual(row["status"], "needs_review")
+        self.assertEqual(row["coverage"]["with_draft"], 0)
+        self.assertTrue(any(
+            "旧版报纸证据" in warning for warning in row["warnings"]
+        ))
+
+    def test_overview_detects_published_page_tamper_even_with_mtime_rollback(self):
+        issue_dir = self.write_issue()
+        api.save_draft(self.archive, self.vault, self.valid_draft())
+        issue = api.get_issue(self.archive, "zgjsb", "2026-08-31")
+        state_path = self.archive / "_state" / "zgjsb" / "2026-08-31.json"
+        state_path.parent.mkdir(parents=True)
+        state_path.write_text(json.dumps({
+            "stages": {"published": "2026-08-31T12:00:00+08:00"},
+            "publish_archive_evidence_sha256": issue["evidence_sha256"],
+            "publish_draft_sha256": issue["draft_sha256"],
+        }), encoding="utf-8")
+
+        before = next(
+            item for item in api.get_daily_dashboard(
+                self.archive, "2026-08-31"
+            )["newspapers"] if item["source"] == "zgjsb"
+        )
+        self.assertEqual(before["status"], "published")
+
+        page = issue_dir / "pages" / "01.jpg"
+        original = page.stat()
+        page.write_bytes(b"tampered-page-with-rolled-back-mtime")
+        os.utime(page, ns=(original.st_atime_ns, original.st_mtime_ns))
+
+        dashboard_row = next(
+            item for item in api.get_daily_dashboard(
+                self.archive, "2026-08-31"
+            )["newspapers"] if item["source"] == "zgjsb"
+        )
+        inbox_row = next(
+            item for item in api.get_inbox(
+                self.archive, day="2026-08-31"
+            )["issues"] if item["source"] == "zgjsb"
+        )
+
+        self.assertNotEqual(dashboard_row["status"], "published")
+        self.assertNotEqual(dashboard_row["publish_status"], "published")
+        self.assertNotEqual(inbox_row["status"], "published")
+        self.assertTrue(any(
+            "旧版报纸证据" in warning
+            for warning in dashboard_row["warnings"]
+        ))
+
     def test_incremental_draft_cannot_bypass_publish_ready_validation(self):
         self.write_issue()
         api.save_draft(self.archive, self.vault, self.bind_draft({
@@ -843,6 +936,83 @@ class WorkbenchAPITest(unittest.TestCase):
         # 每期 7 + 5 字；重复 article 文本不重复计数。
         ok = next(x for x in result["issues"] if x["source"] == "zgjsb")
         self.assertEqual(ok["text_length"], 23)
+
+    def test_inbox_and_dashboard_use_lightweight_issue_overview(self):
+        self.write_issue(source="zgjsb", source_name="中国建设报", issue_no="9167")
+
+        forbidden = AssertionError("列表接口不得加载完整期次或计算发布级证据哈希")
+        with mock.patch.object(api, "get_issue", side_effect=forbidden), \
+                mock.patch.object(api, "_get_issue_locked", side_effect=forbidden), \
+                mock.patch.object(api, "_ocr_blocks", side_effect=forbidden), \
+                mock.patch.object(
+                    api.vault_publisher,
+                    "_issue_tree_evidence_sha256",
+                    side_effect=forbidden,
+                ):
+            inbox = api.get_inbox(self.archive, day="2026-08-31")
+            dashboard = api.get_daily_dashboard(self.archive, "2026-08-31")
+
+        inbox_issue = inbox["issues"][0]
+        dashboard_issue = next(
+            row for row in dashboard["newspapers"]
+            if row["source"] == "zgjsb"
+        )
+        self.assertEqual(inbox_issue["text_length"], 23)
+        self.assertEqual(inbox_issue["coverage"]["editions"], 2)
+        self.assertEqual(dashboard_issue["edition_count"], 2)
+        self.assertTrue(dashboard_issue["available"])
+        self.assertEqual(
+            dashboard_issue["thumbnail"],
+            str(self.archive / "zgjsb" / "2026-08-31" / "pages" / "01.jpg"),
+        )
+
+    def test_full_issue_path_still_uses_strong_evidence_hash(self):
+        self.write_issue()
+        original = api.vault_publisher._issue_tree_evidence_sha256
+
+        with mock.patch.object(
+                api.vault_publisher,
+                "_issue_tree_evidence_sha256",
+                wraps=original,
+        ) as evidence_hash:
+            result = api.get_issue(self.archive, "zgjsb", "2026-08-31")
+
+        self.assertRegex(result["evidence_sha256"], r"^[a-f0-9]{64}$")
+        evidence_hash.assert_called_once_with(
+            self.archive, "zgjsb", "2026-08-31"
+        )
+
+    def test_non_import_api_startup_does_not_load_local_pdf_network_stack(self):
+        probe = r"""
+import json
+import runpy
+import sys
+
+before = set(sys.modules)
+api = runpy.run_path(sys.argv[1], run_name="workbench_api_lazy_probe")
+args = api["_parser"]().parse_args(["newspaper-registry"])
+api["_dispatch"](args)
+print(json.dumps(sorted(
+    name for name in ("local_pdf", "lib", "requests")
+    if name in sys.modules and name not in before
+)))
+"""
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                probe,
+                str(READER_SCRIPTS / "workbench_api.py"),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), [])
+        self.assertEqual(api.MAX_PDF_BYTES, 250 * 1024 * 1024)
+        self.assertEqual(api.MAX_PDF_BYTES, local_pdf_module().MAX_PDF_BYTES)
 
     def test_inbox_source_filter_is_honored_by_api_dispatch(self):
         self.write_issue(source="zgjsb")
@@ -1222,16 +1392,24 @@ class WorkbenchAPITest(unittest.TestCase):
             self.archive, self.vault, "gmrb", "2026-08-31", "opened"
         )
         self.assertEqual(opened["reading_status"], "opened")
+        self.assertEqual(opened["reading_revision"], 1)
         self.assertTrue(opened["last_read_at"])
         self.assertFalse(any(path.is_file() for path in self.vault.rglob("*")))
         completed = api.mark_reading_activity(
             self.archive, self.vault, "gmrb", "2026-08-31", "completed"
         )
         self.assertEqual(completed["reading_status"], "completed")
+        self.assertEqual(completed["reading_revision"], 2)
         self.assertEqual(completed["opened_at"], opened["opened_at"])
+        late_opened = api.mark_reading_activity(
+            self.archive, self.vault, "gmrb", "2026-08-31", "opened"
+        )
+        self.assertEqual(late_opened["reading_status"], "completed")
+        self.assertEqual(late_opened["completed_at"], completed["completed_at"])
         dashboard = api.get_daily_dashboard(self.archive, "2026-08-31")
         row = next(x for x in dashboard["newspapers"] if x["source"] == "gmrb")
         self.assertEqual(row["reading_status"], "completed")
+        self.assertEqual(row["reading_revision"], late_opened["reading_revision"])
         self.assertEqual(row["last_read_at"], completed["last_read_at"])
         self.assertEqual(row["daily_actions"]["read"]["status"], "complete")
 
@@ -1239,6 +1417,41 @@ class WorkbenchAPITest(unittest.TestCase):
             self.archive, self.vault, "gmrb", "2026-08-31", "unread"
         )
         self.assertEqual(unread["reading_status"], "unread")
+
+    def test_automatic_opened_uses_revision_cas_and_cannot_override_newer_unread(self):
+        self.write_issue(source="gmrb", source_name="光明日报", issue_no="1")
+        observed_revision = api._activity_record(
+            api._load_daily_activity(self.archive, "2026-08-31"), "gmrb"
+        )["revision"]
+
+        api.mark_reading_activity(
+            self.archive, self.vault, "gmrb", "2026-08-31", "completed"
+        )
+        explicit_unread = api.mark_reading_activity(
+            self.archive, self.vault, "gmrb", "2026-08-31", "unread"
+        )
+        stale_opened = api.mark_reading_activity(
+            self.archive,
+            self.vault,
+            "gmrb",
+            "2026-08-31",
+            "opened",
+            expected_revision=observed_revision,
+        )
+
+        self.assertEqual(stale_opened["status"], "activity_conflict")
+        self.assertEqual(stale_opened["reading_status"], "unread")
+        self.assertEqual(
+            stale_opened["reading_revision"], explicit_unread["reading_revision"]
+        )
+        row = next(
+            item for item in api.get_daily_dashboard(
+                self.archive, "2026-08-31"
+            )["newspapers"]
+            if item["source"] == "gmrb"
+        )
+        self.assertEqual(row["reading_status"], "unread")
+        self.assertEqual(row["reading_revision"], explicit_unread["reading_revision"])
 
     def test_concurrent_reading_updates_do_not_lose_another_newspaper(self):
         context = multiprocessing.get_context("fork")
@@ -1268,6 +1481,282 @@ class WorkbenchAPITest(unittest.TestCase):
             {row["reading_status"] for row in activity["newspapers"].values()},
             {"opened"},
         )
+
+    def test_case_aliases_share_activity_lock_identity(self):
+        alias = self.archive.with_name(self.archive.name.upper())
+        try:
+            same_directory = os.path.samefile(self.archive, alias)
+        except (FileNotFoundError, OSError):
+            self.skipTest("测试文件系统区分路径大小写")
+        if not same_directory:
+            self.skipTest("测试文件系统区分路径大小写")
+
+        context = multiprocessing.get_context("fork")
+        start = context.Event()
+        barrier = context.Barrier(2)
+        processes = [
+            context.Process(
+                target=_concurrent_activity_worker,
+                args=(
+                    str(root), str(self.vault), source,
+                    "2026-08-31", start, barrier,
+                ),
+            )
+            for root, source in (
+                (self.archive, "zgjsb"),
+                (alias, "rmrb"),
+            )
+        ]
+        for process in processes:
+            process.start()
+        start.set()
+        for process in processes:
+            process.join(timeout=5)
+            self.assertFalse(process.is_alive(), "大小写别名并发保存进程超时")
+            self.assertEqual(process.exitcode, 0)
+
+        activity = api._load_daily_activity(self.archive, "2026-08-31")
+        self.assertEqual(set(activity["newspapers"]), {"zgjsb", "rmrb"})
+
+    def test_archive_json_reads_use_pinned_dirfd_not_pathname_open(self):
+        issue_dir = self.write_issue(source="gmrb", source_name="光明日报")
+        api.mark_reading_activity(
+            self.archive, self.vault, "gmrb", "2026-08-31", "opened"
+        )
+        genuine_issue = json.loads(
+            (issue_dir / "issue.json").read_text(encoding="utf-8")
+        )
+        substituted_issue = json.loads(json.dumps(genuine_issue))
+        substituted_issue["units"][0].pop("text_path", None)
+        substituted_issue["units"][0]["text"] = "攻击者替换的正文"
+        substituted_activity = {
+            "date": "2026-08-31",
+            "newspapers": {
+                "rmrb": {"reading_status": "completed", "revision": 99}
+            },
+        }
+        real_open = open
+        pathname_reads = []
+
+        def substitute_pathname_json(path, *args, **kwargs):
+            path_string = os.path.abspath(os.fspath(path))
+            if path_string == os.path.abspath(str(issue_dir / "issue.json")):
+                pathname_reads.append(path_string)
+                return io.StringIO(json.dumps(substituted_issue))
+            if path_string == os.path.abspath(str(
+                    self.archive / "_activity" / "2026-08-31.json")):
+                pathname_reads.append(path_string)
+                return io.StringIO(json.dumps(substituted_activity))
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch("builtins.open", side_effect=substitute_pathname_json):
+            activity = api._load_daily_activity(self.archive, "2026-08-31")
+            issue = api.get_issue(self.archive, "gmrb", "2026-08-31")
+
+        self.assertEqual(set(activity["newspapers"]), {"gmrb"})
+        self.assertNotEqual(issue["units"][0]["text"], "攻击者替换的正文")
+        self.assertEqual(pathname_reads, [])
+
+    def test_local_pdf_tamper_with_mtime_rollback_invalidates_publication(self):
+        issue_dir = self.write_issue()
+        pdf = self.archive / "_imports" / "fixture" / "paper.pdf"
+        pdf.parent.mkdir(parents=True)
+        pdf.write_bytes(b"%PDF-1.4\nAAAA\n%%EOF")
+        raw = json.loads((issue_dir / "issue.json").read_text(encoding="utf-8"))
+        raw["channel"] = "local_pdf"
+        raw["files"] = {"local_pdf": str(pdf)}
+        raw["source_sha256"] = hashlib.sha256(pdf.read_bytes()).hexdigest()
+        raw["local_pdf_date_verification"] = "verified"
+        (issue_dir / "issue.json").write_text(
+            json.dumps(raw, ensure_ascii=False), encoding="utf-8"
+        )
+
+        api.save_draft(self.archive, self.vault, self.valid_draft())
+        current = api.get_issue(self.archive, "zgjsb", "2026-08-31")
+        state_path = self.archive / "_state" / "zgjsb" / "2026-08-31.json"
+        state_path.parent.mkdir(parents=True)
+        state_path.write_text(json.dumps({
+            "stages": {"published": "2026-08-31T12:00:00+08:00"},
+            "publish_archive_evidence_sha256": current["evidence_sha256"],
+            "publish_draft_sha256": current["draft_sha256"],
+        }), encoding="utf-8")
+        before = next(
+            row for row in api.get_daily_dashboard(
+                self.archive, "2026-08-31"
+            )["newspapers"] if row["source"] == "zgjsb"
+        )
+        self.assertEqual(before["status"], "published")
+
+        original = pdf.stat()
+        pdf.write_bytes(b"%PDF-1.4\nBBBB\n%%EOF")
+        os.utime(pdf, ns=(original.st_atime_ns, original.st_mtime_ns))
+
+        with self.assertRaisesRegex(
+                api.ValidationError, "证据目录无法完整校验"):
+            api.get_issue(self.archive, "zgjsb", "2026-08-31")
+        after = next(
+            row for row in api.get_daily_dashboard(
+                self.archive, "2026-08-31"
+            )["newspapers"] if row["source"] == "zgjsb"
+        )
+        self.assertNotEqual(after["status"], "published")
+        self.assertNotEqual(after["publish_status"], "published")
+
+    def test_local_pdf_check_preserves_legacy_v1_evidence_and_publication(self):
+        issue_dir = self.write_issue()
+        pdf = self.archive / "_imports" / "fixture" / "paper.pdf"
+        pdf.parent.mkdir(parents=True)
+        pdf.write_bytes(b"%PDF-1.4\nlegacy-compatible\n%%EOF")
+        issue_path = issue_dir / "issue.json"
+        raw = json.loads(issue_path.read_text(encoding="utf-8"))
+        raw["channel"] = "local_pdf"
+        raw["files"] = {"local_pdf": str(pdf)}
+        raw["source_sha256"] = hashlib.sha256(pdf.read_bytes()).hexdigest()
+        raw["local_pdf_date_verification"] = "verified"
+        issue_path.write_text(
+            json.dumps(raw, ensure_ascii=False), encoding="utf-8"
+        )
+        legacy_evidence = _legacy_issue_tree_evidence(issue_dir)
+
+        issue = api.get_issue(self.archive, "zgjsb", "2026-08-31")
+        self.assertEqual(issue["evidence_sha256"], legacy_evidence)
+        api.save_draft(self.archive, self.vault, self.valid_draft())
+        current = api.get_issue(self.archive, "zgjsb", "2026-08-31")
+        state_path = self.archive / "_state" / "zgjsb" / "2026-08-31.json"
+        state_path.parent.mkdir(parents=True)
+        state_path.write_text(json.dumps({
+            "stages": {"published": "2026-08-31T12:00:00+08:00"},
+            "publish_archive_evidence_sha256": legacy_evidence,
+            "publish_draft_sha256": current["draft_sha256"],
+        }), encoding="utf-8")
+
+        row = next(
+            item for item in api.get_daily_dashboard(
+                self.archive, "2026-08-31"
+            )["newspapers"] if item["source"] == "zgjsb"
+        )
+        self.assertEqual(row["status"], "published")
+        self.assertEqual(row["publish_status"], "published")
+
+    def test_local_pdf_tamper_before_first_draft_is_rejected(self):
+        issue_dir = self.write_issue()
+        pdf = self.archive / "_imports" / "fixture" / "paper.pdf"
+        pdf.parent.mkdir(parents=True)
+        pdf.write_bytes(b"%PDF-1.4\nORIGINAL\n%%EOF")
+        issue_path = issue_dir / "issue.json"
+        raw = json.loads(issue_path.read_text(encoding="utf-8"))
+        raw["channel"] = "local_pdf"
+        raw["files"] = {"local_pdf": str(pdf)}
+        raw["source_sha256"] = hashlib.sha256(pdf.read_bytes()).hexdigest()
+        raw["local_pdf_date_verification"] = "verified"
+        issue_path.write_text(
+            json.dumps(raw, ensure_ascii=False), encoding="utf-8"
+        )
+
+        pdf.write_bytes(b"%PDF-1.4\nTAMPERED\n%%EOF")
+
+        with self.assertRaisesRegex(
+                api.ValidationError, "证据目录无法完整校验"):
+            api.get_issue(self.archive, "zgjsb", "2026-08-31")
+
+    def test_local_pdf_accepts_case_alias_of_same_archive_inode(self):
+        alias = self.archive.with_name(self.archive.name.upper())
+        try:
+            same_directory = os.path.samefile(self.archive, alias)
+        except (FileNotFoundError, OSError):
+            self.skipTest("测试文件系统区分路径大小写")
+        if not same_directory:
+            self.skipTest("测试文件系统区分路径大小写")
+        issue_dir = self.write_issue()
+        pdf = self.archive / "_imports" / "fixture" / "paper.pdf"
+        pdf.parent.mkdir(parents=True)
+        pdf.write_bytes(b"%PDF-1.4\ncase-alias\n%%EOF")
+        issue_path = issue_dir / "issue.json"
+        raw = json.loads(issue_path.read_text(encoding="utf-8"))
+        raw["channel"] = "local_pdf"
+        raw["files"] = {
+            "local_pdf": str(alias / "_imports" / "fixture" / "paper.pdf")
+        }
+        raw["source_sha256"] = hashlib.sha256(pdf.read_bytes()).hexdigest()
+        raw["local_pdf_date_verification"] = "verified"
+        issue_path.write_text(
+            json.dumps(raw, ensure_ascii=False), encoding="utf-8"
+        )
+
+        issue = api.get_issue(self.archive, "zgjsb", "2026-08-31")
+
+        self.assertRegex(issue["evidence_sha256"], r"^[a-f0-9]{64}$")
+        self.assertEqual(issue["pdf_path"], str(pdf))
+
+    def test_local_pdf_rejects_case_similar_prefix_with_different_inode(self):
+        issue_dir = self.write_issue()
+        similar = self.base / "ARCHlVE"
+        pdf = similar / "_imports" / "fixture" / "paper.pdf"
+        pdf.parent.mkdir(parents=True)
+        pdf.write_bytes(b"%PDF-1.4\ndifferent-inode\n%%EOF")
+        issue_path = issue_dir / "issue.json"
+        raw = json.loads(issue_path.read_text(encoding="utf-8"))
+        raw["channel"] = "local_pdf"
+        raw["files"] = {"local_pdf": str(pdf)}
+        raw["source_sha256"] = hashlib.sha256(pdf.read_bytes()).hexdigest()
+        raw["local_pdf_date_verification"] = "verified"
+        issue_path.write_text(
+            json.dumps(raw, ensure_ascii=False), encoding="utf-8"
+        )
+
+        with self.assertRaisesRegex(
+                api.ValidationError, "证据目录无法完整校验"):
+            api.get_issue(self.archive, "zgjsb", "2026-08-31")
+
+    def test_local_pdf_rejects_symlink_archive_alias(self):
+        issue_dir = self.write_issue()
+        pdf = self.archive / "_imports" / "fixture" / "paper.pdf"
+        pdf.parent.mkdir(parents=True)
+        pdf.write_bytes(b"%PDF-1.4\nsymlink-alias\n%%EOF")
+        alias = self.base / "archive-link"
+        alias.symlink_to(self.archive, target_is_directory=True)
+        issue_path = issue_dir / "issue.json"
+        raw = json.loads(issue_path.read_text(encoding="utf-8"))
+        raw["channel"] = "local_pdf"
+        raw["files"] = {
+            "local_pdf": str(alias / "_imports" / "fixture" / "paper.pdf")
+        }
+        raw["source_sha256"] = hashlib.sha256(pdf.read_bytes()).hexdigest()
+        raw["local_pdf_date_verification"] = "verified"
+        issue_path.write_text(
+            json.dumps(raw, ensure_ascii=False), encoding="utf-8"
+        )
+
+        with self.assertRaisesRegex(
+                api.ValidationError, "证据目录无法完整校验"):
+            api.get_issue(self.archive, "zgjsb", "2026-08-31")
+
+    def test_local_pdf_evidence_rejects_escape_missing_and_symlink(self):
+        issue_dir = self.write_issue()
+        issue_path = issue_dir / "issue.json"
+        original = json.loads(issue_path.read_text(encoding="utf-8"))
+        outside = self.base / "outside.pdf"
+        outside.write_bytes(b"%PDF-1.4\noutside\n%%EOF")
+        symlink = self.archive / "_imports" / "linked.pdf"
+        symlink.parent.mkdir(parents=True)
+        symlink.symlink_to(outside)
+        cases = {
+            "escape": outside,
+            "missing": self.archive / "_imports" / "missing.pdf",
+            "symlink": symlink,
+        }
+
+        for name, reference in cases.items():
+            raw = json.loads(json.dumps(original))
+            raw["channel"] = "local_pdf"
+            raw["files"] = {"local_pdf": str(reference)}
+            raw["local_pdf_date_verification"] = "verified"
+            issue_path.write_text(
+                json.dumps(raw, ensure_ascii=False), encoding="utf-8"
+            )
+            with self.subTest(case=name), self.assertRaisesRegex(
+                    api.ValidationError, "证据目录无法完整校验"):
+                api.get_issue(self.archive, "zgjsb", "2026-08-31")
 
     def test_reading_activity_rejects_invalid_source_status_and_missing_completion(self):
         with self.assertRaises(api.ValidationError):
@@ -1400,7 +1889,7 @@ class WorkbenchAPITest(unittest.TestCase):
                 ],
             }
 
-        with mock.patch.object(api.local_pdf, "run_pdfocr", side_effect=fake_render):
+        with mock.patch.object(local_pdf_module(), "run_pdfocr", side_effect=fake_render):
             first = api.import_file(self.archive, source_pdf, source="zgjsb")
             second = api.import_file(self.archive, source_pdf, source="zgjsb")
 
@@ -1426,12 +1915,13 @@ class WorkbenchAPITest(unittest.TestCase):
             "page_count": 8,
             "pdf_path": str(source_pdf),
             "issue_path": str(self.archive / "zgjsb" / "2026-09-02" / "issue.json"),
-            "source_sha256": api.local_pdf.sha256_file(source_pdf),
+            "source_sha256": local_pdf_module().sha256_file(source_pdf),
             "warnings": ["第2版 OCR 文字不足，需人工复核或重跑。"],
             "needs_review": True,
             "imported": True,
         }
-        with mock.patch.object(api.local_pdf, "import_pdf", return_value=delegated) as importer:
+        with mock.patch.object(
+                local_pdf_module(), "import_pdf", return_value=delegated) as importer:
             result = api.import_file(self.archive, source_pdf, source="zgjsb")
         self.assertEqual(result["status"], "needs_review")
         self.assertFalse(result["issue_linked"])
@@ -1460,13 +1950,13 @@ class WorkbenchAPITest(unittest.TestCase):
             "issue_path": str(
                 self.archive / "zgjsb" / "2026-09-02" / "issue.json"
             ),
-            "source_sha256": api.local_pdf.sha256_file(source_pdf),
+            "source_sha256": local_pdf_module().sha256_file(source_pdf),
             "warnings": [],
             "needs_review": False,
             "imported": True,
         }
         with mock.patch.object(
-                api.local_pdf, "import_pdf", return_value=delegated) as importer:
+                local_pdf_module(), "import_pdf", return_value=delegated) as importer:
             api.import_file(
                 self.archive,
                 source_pdf,
@@ -1482,7 +1972,7 @@ class WorkbenchAPITest(unittest.TestCase):
         vault_alias = self.base / "vault-alias"
         vault_alias.symlink_to(self.vault, target_is_directory=True)
 
-        with mock.patch.object(api.local_pdf, "import_pdf") as importer:
+        with mock.patch.object(local_pdf_module(), "import_pdf") as importer:
             with self.assertRaises(api.PathSafetyError):
                 api.import_file(
                     self.vault,
@@ -1520,7 +2010,7 @@ class WorkbenchAPITest(unittest.TestCase):
             "--path", str(source_pdf),
         ])
 
-        with mock.patch.object(api.local_pdf, "import_pdf") as importer:
+        with mock.patch.object(local_pdf_module(), "import_pdf") as importer:
             with self.assertRaises(api.PathSafetyError):
                 api._dispatch(args)
 
@@ -1532,7 +2022,7 @@ class WorkbenchAPITest(unittest.TestCase):
         source_pdf.write_bytes(b"%PDF-1.4\nlocal-test\n%%EOF")
         (self.archive / "_imports").symlink_to(self.vault, target_is_directory=True)
 
-        with mock.patch.object(api.local_pdf, "import_pdf") as importer:
+        with mock.patch.object(local_pdf_module(), "import_pdf") as importer:
             with self.assertRaises(api.PathSafetyError):
                 api.import_file(
                     self.archive,

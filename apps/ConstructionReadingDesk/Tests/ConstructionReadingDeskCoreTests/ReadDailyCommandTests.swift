@@ -17,7 +17,7 @@ struct ReadDailyCommandTests {
 
         #expect(request.executableURL.path == "/opt/custom/bin/python3")
         #expect(request.arguments == [
-            "/Users/test/readdaily/scripts/readdaily.py", "api", "capabilities",
+            "/Users/test/readdaily/skills/newspaper-reader/scripts/workbench_api.py", "capabilities",
             "--archive", "/Users/test/Library/Application Support/readdaily/news-archive",
             "--vault", "/Users/test/Maitty的知识库",
         ])
@@ -30,6 +30,8 @@ struct ReadDailyCommandTests {
             .issue(source: "zgjsb", date: "2026-09-01")
         )
 
+        #expect(request.arguments.first == "/Users/test/readdaily/skills/newspaper-reader/scripts/workbench_api.py")
+        #expect(request.arguments[1] == "issue")
         #expect(Array(request.arguments.suffix(4)) == ["--source", "zgjsb", "--date", "2026-09-01"])
     }
 
@@ -72,6 +74,19 @@ struct ReadDailyCommandTests {
         #expect(Array(request.arguments.suffix(6)) == [
             "--source", "rmrb", "--date", "2026-09-03", "--status", "completed",
         ])
+
+        let automatic = try ReadDailyCommandFactory(configuration: configuration).make(
+            .readingMark(
+                source: "rmrb",
+                date: "2026-09-03",
+                status: .opened,
+                expectedRevision: 7
+            )
+        )
+        #expect(Array(automatic.arguments.suffix(8)) == [
+            "--source", "rmrb", "--date", "2026-09-03", "--status", "opened",
+            "--expected-reading-revision", "7",
+        ])
     }
 
     @Test("导入命令保留 PDF 路径、日期与来源")
@@ -96,5 +111,34 @@ struct ReadDailyCommandTests {
             "/Users/test/readdaily/scripts/readdaily.py", "fetch", "--date", "2026-09-03",
         ])
         #expect(!request.arguments.contains("--source"))
+    }
+
+    @Test("客户端校验 API 命令实际使用的工作台脚本")
+    func clientValidatesActualWorkbenchScript() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("readdaily-command-\(UUID().uuidString)", isDirectory: true)
+        let scripts = root.appendingPathComponent("scripts", isDirectory: true)
+        try FileManager.default.createDirectory(at: scripts, withIntermediateDirectories: true)
+        try Data("#!/usr/bin/env python3\n".utf8)
+            .write(to: scripts.appendingPathComponent("readdaily.py"))
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let missingWorkbench = root
+            .appendingPathComponent("skills/newspaper-reader/scripts/workbench_api.py").path
+        let client = ReadDailyClient(configuration: ReadDailyConfiguration(
+            repositoryURL: root,
+            archiveURL: root.appendingPathComponent("archive", isDirectory: true),
+            vaultURL: root.appendingPathComponent("vault", isDirectory: true),
+            pythonExecutableURL: URL(fileURLWithPath: "/usr/bin/python3")
+        ))
+
+        do {
+            _ = try await client.perform(.capabilities)
+            Issue.record("预期拒绝缺失的工作台 API 脚本")
+        } catch let error as ReadDailyClientError {
+            #expect(error == .scriptMissing(missingWorkbench))
+        } catch {
+            Issue.record("收到非预期错误：\(error)")
+        }
     }
 }

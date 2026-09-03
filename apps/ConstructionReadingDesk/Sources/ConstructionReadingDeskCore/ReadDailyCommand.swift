@@ -56,7 +56,12 @@ public enum ReadDailyAPICommand: Equatable, Sendable {
     case publishApply(planID: String)
     case history
     case rollback(transactionID: String)
-    case readingMark(source: String, date: String, status: ReadingCompletionStatus)
+    case readingMark(
+        source: String,
+        date: String,
+        status: ReadingCompletionStatus,
+        expectedRevision: Int? = nil
+    )
     case fetchDaily(date: String)
     case fetchConstruction(date: String? = nil)
 }
@@ -91,7 +96,8 @@ public struct ReadDailyCommandFactory: Sendable {
     }
 
     public func make(_ command: ReadDailyAPICommand) throws -> ProcessRequest {
-        let script = configuration.repositoryURL.appendingPathComponent("scripts/readdaily.py").path
+        let commandLineScript = configuration.repositoryURL
+            .appendingPathComponent("scripts/readdaily.py").path
         let environment = [
             "READDAILY_ARCHIVE": configuration.archiveURL.path,
             "READDAILY_VAULT": configuration.vaultURL.path,
@@ -101,7 +107,7 @@ public struct ReadDailyCommandFactory: Sendable {
         ]
 
         if case .fetchConstruction(let date) = command {
-            var arguments = [script, "fetch", "--source", "zgjsb"]
+            var arguments = [commandLineScript, "fetch", "--source", "zgjsb"]
             append("--date", date, to: &arguments)
             return ProcessRequest(
                 executableURL: configuration.pythonExecutableURL,
@@ -110,7 +116,7 @@ public struct ReadDailyCommandFactory: Sendable {
             )
         }
         if case .fetchDaily(let date) = command {
-            var arguments = [script, "fetch"]
+            var arguments = [commandLineScript, "fetch"]
             append("--date", date, to: &arguments)
             return ProcessRequest(
                 executableURL: configuration.pythonExecutableURL,
@@ -119,7 +125,9 @@ public struct ReadDailyCommandFactory: Sendable {
             )
         }
 
-        var arguments = [script, "api", command.name]
+        let workbenchScript = configuration.repositoryURL
+            .appendingPathComponent("skills/newspaper-reader/scripts/workbench_api.py").path
+        var arguments = [workbenchScript, command.name]
         arguments += ["--archive", configuration.archiveURL.path, "--vault", configuration.vaultURL.path]
 
         switch command {
@@ -145,10 +153,11 @@ public struct ReadDailyCommandFactory: Sendable {
         case .rollback(let transactionID):
             guard !transactionID.isEmpty else { throw CommandFactoryError.emptyIdentifier("发布记录编号") }
             arguments += ["--transaction-id", transactionID]
-        case .readingMark(let source, let date, let status):
+        case .readingMark(let source, let date, let status, let expectedRevision):
             append("--source", source, to: &arguments)
             append("--date", date, to: &arguments)
             append("--status", status.rawValue, to: &arguments)
+            append("--expected-reading-revision", expectedRevision.map(String.init), to: &arguments)
         case .fetchDaily, .fetchConstruction:
             break
         }

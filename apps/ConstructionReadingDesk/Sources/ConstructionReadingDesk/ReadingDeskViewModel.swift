@@ -9,6 +9,35 @@ struct PresentedError: Identifiable {
     let recovery: String
 }
 
+struct IssuePayloadMappingExecutor: Sendable {
+    typealias Transform = @Sendable (JSONValue?) throws -> IssueDetail
+
+    private let transform: Transform
+
+    init(
+        transform: @escaping Transform = { value in
+            try WorkbenchPayloadMapper().issue(from: value)
+        }
+    ) {
+        self.transform = transform
+    }
+
+    func map(_ value: JSONValue?) async throws -> IssueDetail {
+        let transform = self.transform
+        let mappingTask = Task.detached(priority: .userInitiated) {
+            try Task.checkCancellation()
+            let issue = try transform(value)
+            try Task.checkCancellation()
+            return issue
+        }
+        return try await withTaskCancellationHandler {
+            try await mappingTask.value
+        } onCancel: {
+            mappingTask.cancel()
+        }
+    }
+}
+
 @MainActor
 final class ReadingDeskViewModel: ObservableObject {
     @Published private(set) var issues: [IssueSummary] = []
@@ -22,6 +51,8 @@ final class ReadingDeskViewModel: ObservableObject {
     @Published private(set) var dirtyUnitIDs: Set<String> = []
     @Published private(set) var isBusy = false
     @Published private(set) var operationTitle = ""
+    @Published private(set) var isIssueLoading = false
+    @Published private(set) var issueLoadTitle = ""
     @Published var presentedError: PresentedError?
     @Published var publishPlan: PublishPlan? {
         didSet {
@@ -40,6 +71,23 @@ final class ReadingDeskViewModel: ObservableObject {
     private var editRevision = 0
     private var publishPlanRevision: Int?
     private let clientFactory: (ReadDailyConfiguration) -> ReadDailyClient
+    private let issuePayloadMappingExecutor: IssuePayloadMappingExecutor
+    private var issueLoadTask: Task<Void, Never>?
+    private var issueLoadGeneration = 0
+    private var readingMarkTasks: [IssueCacheKey: Task<Void, Never>] = [:]
+    private var readingMarkTaskIDs: [IssueCacheKey: UUID] = [:]
+    private var readingStatusOverrides: [IssueCacheKey: ReadingCompletionStatus] = [:]
+    private var readingStatusRevisions: [IssueCacheKey: UInt64] = [:]
+    private var readingBackendRevisions: [IssueCacheKey: Int] = [:]
+    private var nextReadingStatusRevision: UInt64 = 0
+    private var issueCache: [IssueCacheKey: IssueDetail] = [:]
+    private var issueCacheOrder: [IssueCacheKey] = []
+    private let issueCacheCapacity = 8
+
+    private struct IssueCacheKey: Hashable, Sendable {
+        let source: String
+        let date: String
+    }
 
     private enum NavigationAction: Equatable, Sendable {
         case refresh
@@ -65,11 +113,15 @@ final class ReadingDeskViewModel: ObservableObject {
 
     init(
         settings: AppSettings,
+        issuePayloadMapper: @escaping IssuePayloadMappingExecutor.Transform = { value in
+            try WorkbenchPayloadMapper().issue(from: value)
+        },
         clientFactory: @escaping (ReadDailyConfiguration) -> ReadDailyClient = {
             ReadDailyClient(configuration: $0)
         }
     ) {
         self.settings = settings
+        issuePayloadMappingExecutor = IssuePayloadMappingExecutor(transform: issuePayloadMapper)
         self.clientFactory = clientFactory
     }
 
@@ -82,9 +134,17 @@ final class ReadingDeskViewModel: ObservableObject {
     }
 
     var selectedReadingStatus: ReadingCompletionStatus {
-        dashboardDay?.entries.first { $0.issue?.stableID == selectedIssueID }?.readingStatus
-            ?? selectedIssue?.readingStatus.flatMap(ReadingCompletionStatus.init(rawValue:))
-            ?? .unread
+        guard let issue = selectedIssue else { return .unread }
+        return readingStatus(for: IssueCacheKey(source: issue.sourceID, date: issue.date))
+    }
+
+    func displayedReadingStatus(for entry: DailyNewspaperEntry) -> ReadingCompletionStatus {
+        let date = entry.issue?.date ?? dashboardDay?.date ?? selectedDate ?? ""
+        return readingStatus(for: IssueCacheKey(source: entry.source.id, date: date))
+    }
+
+    var displayedReadCount: Int {
+        dashboardDay?.entries.filter { displayedReadingStatus(for: $0) == .completed }.count ?? 0
     }
 
     var canPublishSelectedIssue: Bool { issueDetail?.sourceID == constructionSourceID }
@@ -129,6 +189,7 @@ final class ReadingDeskViewModel: ObservableObject {
     }
 
     private func applySettingsNow(_ values: ReadDailySettingsValues) {
+        invalidateIssueCache(cancelReadingMarks: true)
         settings.apply(values)
         issues = []
         dashboardDay = nil
@@ -144,6 +205,7 @@ final class ReadingDeskViewModel: ObservableObject {
 
     private func refreshNow() {
         guard !isBusy else { return }
+        invalidateIssueCache()
         invalidateLoadedIssue()
         run(title: "正在刷新收件箱", retry: .refresh) { [weak self] in
             guard let self else { return }
@@ -173,7 +235,12 @@ final class ReadingDeskViewModel: ObservableObject {
             let first = self.issues.first { $0.date == date }
             self.selectedIssueID = first?.stableID
             if let first {
-                try await self.loadIssueNow(source: first.sourceID, date: first.date, client: client, recordOpened: true)
+                self.startIssueLoad(
+                    source: first.sourceID,
+                    date: first.date,
+                    client: client,
+                    recordOpened: true
+                )
             } else {
                 self.clearIssueSelection()
             }
@@ -193,15 +260,17 @@ final class ReadingDeskViewModel: ObservableObject {
     private func selectIssueNow(_ id: String?) {
         guard !isBusy else { return }
         selectedIssueID = id
-        invalidateLoadedIssue()
         guard let issue = selectedIssue else {
+            invalidateLoadedIssue()
             return
         }
-        run(title: "正在读取整期报纸", retry: .loadIssue(issue.sourceID, issue.date)) { [weak self] in
-            guard let self else { return }
-            self.selectedDate = issue.date
-            try await self.loadIssueNow(source: issue.sourceID, date: issue.date, client: self.makeClient(), recordOpened: true)
-        }
+        selectedDate = issue.date
+        startIssueLoad(
+            source: issue.sourceID,
+            date: issue.date,
+            client: makeClient(),
+            recordOpened: true
+        )
     }
 
     func selectEdition(_ id: String?) {
@@ -299,6 +368,7 @@ final class ReadingDeskViewModel: ObservableObject {
 
     private func fetchDailyPapersNow(date: String) {
         guard !isBusy else { return }
+        invalidateIssueCache()
         selectedDate = date
         invalidateLoadedIssue(clearSelection: true)
         run(title: "正在抓取 \(date) 当日8报", retry: .fetchDaily(date)) { [weak self] in
@@ -331,6 +401,7 @@ final class ReadingDeskViewModel: ObservableObject {
 
     private func importPDFNow(_ url: URL, removeAfterImport: Bool) {
         guard !isBusy else { return }
+        invalidateIssueCache()
         invalidateLoadedIssue(clearSelection: true)
         run(title: "正在导入并解析 PDF", retry: .importPDF(url, removeAfterImport)) { [weak self] in
             guard let self else { return }
@@ -356,7 +427,7 @@ final class ReadingDeskViewModel: ObservableObject {
                 self.selectedDate = date
                 self.selectedIssueID = issue.stableID
                 await self.loadDashboardNow(date: date, client: client)
-                try await self.loadIssueNow(source: source, date: date, client: client, recordOpened: true)
+                self.startIssueLoad(source: source, date: date, client: client, recordOpened: true)
             }
             self.notice = "PDF 已导入归档目录，等待人工复核。"
         }
@@ -366,6 +437,7 @@ final class ReadingDeskViewModel: ObservableObject {
         run(title: "正在保存整期草稿", retry: .save) { [weak self] in
             guard let self else { return }
             let request = try self.makeDraftRequest(requirePublishReady: false)
+            self.removeIssueFromCache(source: request.source, date: request.date)
             let revision = self.editRevision
             let envelope = try await self.makeClient().saveDraft(request)
             self.lastLog = envelope.warnings.joined(separator: "\n")
@@ -392,6 +464,7 @@ final class ReadingDeskViewModel: ObservableObject {
                 )
             }
             let request = try self.makeDraftRequest(requirePublishReady: true)
+            self.removeIssueFromCache(source: request.source, date: request.date)
             let revision = self.editRevision
             self.publishPlan = nil
             let client = self.makeClient()
@@ -466,14 +539,44 @@ final class ReadingDeskViewModel: ObservableObject {
     }
 
     func markSelectedIssue(_ status: ReadingCompletionStatus) {
+        guard !isBusy else { return }
         guard let issue = selectedIssue else { return }
+        let key = IssueCacheKey(source: issue.sourceID, date: issue.date)
+        cancelAutomaticReadingMark(for: key)
         run(title: status == .completed ? "正在标记今日已读" : "正在更新阅读状态", retry: .readingMark(status)) { [weak self] in
             guard let self else { return }
             let client = self.makeClient()
-            let envelope = try await client.perform(.readingMark(source: issue.sourceID, date: issue.date, status: status))
-            self.lastLog = envelope.warnings.joined(separator: "\n")
-            await self.loadDashboardNow(date: issue.date, client: client)
-            self.notice = status == .completed ? "已记录今日读完 \(issue.sourceName ?? issue.sourceID)。" : "已撤销今日完成标记。"
+            do {
+                let envelope = try await client.perform(
+                    .readingMark(source: issue.sourceID, date: issue.date, status: status)
+                )
+                self.lastLog = envelope.warnings.joined(separator: "\n")
+                let persistedStatus = envelope.data?.objectValue?["reading_status"]?.stringValue
+                    .flatMap(ReadingCompletionStatus.init(rawValue:)) ?? status
+                let backendRevision = envelope.data?.objectValue?["reading_revision"]?.intValue
+                self.setLocalReadingStatus(
+                    persistedStatus,
+                    for: key,
+                    backendRevision: backendRevision
+                )
+                await self.loadDashboardNow(date: issue.date, client: client)
+                self.notice = status == .completed
+                    ? "已记录今日读完 \(issue.sourceName ?? issue.sourceID)。"
+                    : "已撤销今日完成标记。"
+            } catch {
+                // The cancelled automatic ``opened`` process may already have
+                // committed.  Re-read the authoritative dashboard instead of
+                // guessing which status won the race.
+                let reconciled = await self.loadDashboardNow(date: issue.date, client: client)
+                if !reconciled {
+                    // Drop the speculative overlay when neither write nor
+                    // reconciliation can be confirmed.  The inbox snapshot is
+                    // the last known durable state and a later refresh can
+                    // resolve an already-committed automatic write.
+                    self.clearReadingStatusOverride(for: key)
+                }
+                throw error
+            }
         }
     }
 
@@ -483,10 +586,7 @@ final class ReadingDeskViewModel: ObservableObject {
         switch retryAction {
         case .refresh: refresh()
         case .loadIssue(let source, let date):
-            run(title: "正在重新读取报纸", retry: retryAction) { [weak self] in
-                guard let self else { return }
-                try await self.loadIssueNow(source: source, date: date, client: self.makeClient())
-            }
+            startIssueLoad(source: source, date: date, client: makeClient(), recordOpened: false)
         case .fetchDaily(let date):
             selectedDate = date
             fetchDailyPapers()
@@ -537,8 +637,11 @@ final class ReadingDeskViewModel: ObservableObject {
     }
 
     private func refreshInboxNow(client: ReadDailyClient, loadSelection: Bool) async throws {
+        let issuesBeforeRequest = Dictionary(uniqueKeysWithValues: issues.map { ($0.stableID, $0) })
+        let readingRevisionSnapshot = readingStatusRevisions
         let envelope = try await client.perform(.inbox())
-        let mapped = try WorkbenchPayloadMapper().inbox(from: envelope.data)
+        let issuesAtResponse = Dictionary(uniqueKeysWithValues: issues.map { ($0.stableID, $0) })
+        let responseIssues = try WorkbenchPayloadMapper().inbox(from: envelope.data)
             .filter { NewspaperRegistry.source(id: $0.sourceID) != nil }
             .sorted { left, right in
                 if left.date != right.date { return left.date > right.date }
@@ -546,6 +649,21 @@ final class ReadingDeskViewModel: ObservableObject {
                 let rightOrder = NewspaperRegistry.dailySources.firstIndex { $0.id == right.sourceID } ?? .max
                 return leftOrder < rightOrder
             }
+        let mapped = responseIssues.map { responseIssue in
+            let key = IssueCacheKey(source: responseIssue.sourceID, date: responseIssue.date)
+            let revisionChanged = readingStatusRevisions[key] != readingRevisionSnapshot[key]
+            let confirmed = revisionChanged
+                ? issuesAtResponse[responseIssue.stableID] ?? issuesBeforeRequest[responseIssue.stableID]
+                : issuesBeforeRequest[responseIssue.stableID]
+            guard let confirmed,
+                  responseIssue.readingStatus == nil || revisionChanged else {
+                return responseIssue
+            }
+            // The compact inbox endpoint may omit reading_status entirely.
+            // Preserve the last confirmed local snapshot until the dashboard
+            // supplies a newer authoritative value.
+            return replacingReadingStatus(in: responseIssue, with: confirmed.readingStatus)
+        }
         issues = mapped
 
         let legacyDates = Array(Set(mapped.map(\.date))).sorted(by: >)
@@ -560,9 +678,14 @@ final class ReadingDeskViewModel: ObservableObject {
             await loadDashboardNow(date: date, client: client)
         } else {
             do {
+                let readingRevisionSnapshot = readingStatusRevisions
                 let dashboardEnvelope = try await client.perform(.dailyDashboard())
                 let day = try WorkbenchPayloadMapper().dailyDashboard(from: dashboardEnvelope.data)
-                applyDashboard(day, legacyDates: legacyDates)
+                applyDashboard(
+                    day,
+                    legacyDates: legacyDates,
+                    readingRevisionSnapshot: readingRevisionSnapshot
+                )
                 selectedDate = day.date
                 lastLog = (envelope.warnings + dashboardEnvelope.warnings).joined(separator: "\n")
             } catch {
@@ -582,7 +705,7 @@ final class ReadingDeskViewModel: ObservableObject {
         let issue = current ?? mapped.first { $0.date == date }
         selectedIssueID = issue?.stableID
         if let issue {
-            try await loadIssueNow(
+            startIssueLoad(
                 source: issue.sourceID,
                 date: issue.date,
                 client: client,
@@ -593,13 +716,20 @@ final class ReadingDeskViewModel: ObservableObject {
         }
     }
 
-    private func loadDashboardNow(date: String, client: ReadDailyClient) async {
+    @discardableResult
+    private func loadDashboardNow(date: String, client: ReadDailyClient) async -> Bool {
         let legacyDates = Array(Set(issues.map(\.date))).sorted(by: >)
+        let readingRevisionSnapshot = readingStatusRevisions
         do {
             let envelope = try await client.perform(.dailyDashboard(date: date))
             let day = try WorkbenchPayloadMapper().dailyDashboard(from: envelope.data)
-            applyDashboard(day, legacyDates: legacyDates)
+            applyDashboard(
+                day,
+                legacyDates: legacyDates,
+                readingRevisionSnapshot: readingRevisionSnapshot
+            )
             lastLog = envelope.warnings.joined(separator: "\n")
+            return true
         } catch {
             dashboardDay = DailyReadingDashboard(issues: issues).day(for: date)
             availableDates = ReadingDatePolicy.menuDates(
@@ -609,10 +739,32 @@ final class ReadingDeskViewModel: ObservableObject {
             )
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             lastLog = "仪表盘使用兼容模式：\(message)"
+            return false
         }
     }
 
-    private func applyDashboard(_ day: DailyReadingDay, legacyDates: [String]) {
+    private func applyDashboard(
+        _ day: DailyReadingDay,
+        legacyDates: [String],
+        readingRevisionSnapshot: [IssueCacheKey: UInt64]
+    ) {
+        let responseRevisions = Dictionary(uniqueKeysWithValues: day.entries.map { entry in
+            (IssueCacheKey(source: entry.source.id, date: day.date), entry.readingRevision)
+        })
+        func responseIsStale(for key: IssueCacheKey) -> Bool {
+            let localWriteFinishedAfterRequest =
+                readingStatusRevisions[key] != readingRevisionSnapshot[key]
+            let backendRevisionWentBackwards =
+                (responseRevisions[key] ?? 0) < (readingBackendRevisions[key] ?? 0)
+            return localWriteFinishedAfterRequest || backendRevisionWentBackwards
+        }
+        readingStatusOverrides = readingStatusOverrides.filter {
+            guard $0.key.date == day.date else { return true }
+            if readingMarkTasks[$0.key] != nil { return true }
+            // A status write completed after this dashboard request began.
+            // Keep the newer local result until a later authoritative refresh.
+            return responseIsStale(for: $0.key)
+        }
         dashboardDay = day
         availableDates = ReadingDatePolicy.menuDates(
             availableDates: day.availableDates + legacyDates + [day.date],
@@ -621,12 +773,35 @@ final class ReadingDeskViewModel: ObservableObject {
         )
         let dashboardIssues = day.entries.compactMap(\.issue)
         var byID = Dictionary(uniqueKeysWithValues: issues.map { ($0.stableID, $0) })
-        dashboardIssues.forEach { byID[$0.stableID] = $0 }
+        dashboardIssues.forEach { dashboardIssue in
+            let key = IssueCacheKey(source: dashboardIssue.sourceID, date: dashboardIssue.date)
+            if responseIsStale(for: key),
+               let current = byID[dashboardIssue.stableID] {
+                // The response was captured before a newer local write
+                // completed.  Accept its metadata, but do not roll back the
+                // last confirmed reading state stored in the inbox snapshot.
+                byID[dashboardIssue.stableID] = replacingReadingStatus(
+                    in: dashboardIssue,
+                    with: current.readingStatus
+                )
+            } else {
+                byID[dashboardIssue.stableID] = dashboardIssue
+            }
+        }
         issues = byID.values.sorted { left, right in
             if left.date != right.date { return left.date > right.date }
             let leftOrder = NewspaperRegistry.dailySources.firstIndex { $0.id == left.sourceID } ?? .max
             let rightOrder = NewspaperRegistry.dailySources.firstIndex { $0.id == right.sourceID } ?? .max
             return leftOrder < rightOrder
+        }
+        for entry in day.entries {
+            let key = IssueCacheKey(source: entry.source.id, date: day.date)
+            if !responseIsStale(for: key) {
+                readingBackendRevisions[key] = max(
+                    readingBackendRevisions[key] ?? 0,
+                    entry.readingRevision
+                )
+            }
         }
     }
 
@@ -636,6 +811,7 @@ final class ReadingDeskViewModel: ObservableObject {
     }
 
     private func invalidateLoadedIssue(clearSelection: Bool = false) {
+        cancelIssueLoad()
         if clearSelection { selectedIssueID = nil }
         issueDetail = nil
         selectedEditionID = nil
@@ -645,42 +821,315 @@ final class ReadingDeskViewModel: ObservableObject {
         editRevision += 1
     }
 
-    private func loadIssueNow(
+    private func startIssueLoad(
         source: String,
         date: String,
         client: ReadDailyClient,
         recordOpened: Bool = false
-    ) async throws {
-        let envelope = try await client.perform(.issue(source: source, date: date))
-        let loadedIssue = try WorkbenchPayloadMapper().issue(from: envelope.data)
-        guard loadedIssue.sourceID == source, loadedIssue.date == date else {
-            throw ReadDailyClientError.backendRejected(
-                message: "读报后端返回了其他报纸或日期的内容。",
-                recovery: "请刷新收件箱后重新选择目标报纸。"
-            )
+    ) {
+        invalidateLoadedIssue()
+        let key = IssueCacheKey(source: source, date: date)
+        let readingStatusAtOpen = readingStatus(for: key)
+        let readingRevisionAtOpen = readingRevision(for: key)
+        retryAction = .loadIssue(source, date)
+        presentedError = nil
+
+        if let cached = cachedIssue(for: key) {
+            applyLoadedIssue(cached, warnings: [], key: key)
+            if recordOpened {
+                recordOpenedInBackgroundIfNeeded(
+                    key: key,
+                    previousStatus: readingStatusAtOpen,
+                    expectedRevision: readingRevisionAtOpen,
+                    client: client,
+                    issueWarnings: []
+                )
+            }
+            return
         }
-        guard let intendedIssue = selectedIssue,
-              intendedIssue.sourceID == source,
-              intendedIssue.date == date else {
-            throw ReadDailyClientError.backendRejected(
-                message: "所选报纸已变化，已忽略过期的加载结果。",
-                recovery: "请重新选择要阅读的报纸。"
-            )
+
+        isIssueLoading = true
+        issueLoadTitle = "正在读取整期报纸"
+        let generation = issueLoadGeneration
+        issueLoadTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let envelope = try await client.perform(.issue(source: source, date: date))
+                try Task.checkCancellation()
+                let loadedIssue = try await self.issuePayloadMappingExecutor.map(envelope.data)
+                try Task.checkCancellation()
+                guard self.isCurrentIssueLoad(generation: generation, key: key) else { return }
+                guard loadedIssue.sourceID == source, loadedIssue.date == date else {
+                    throw ReadDailyClientError.backendRejected(
+                        message: "读报后端返回了其他报纸或日期的内容。",
+                        recovery: "请刷新收件箱后重新选择目标报纸。"
+                    )
+                }
+
+                self.storeIssueInCache(loadedIssue, for: key)
+                self.applyLoadedIssue(loadedIssue, warnings: envelope.warnings, key: key)
+                self.finishIssueLoad(generation: generation)
+                if recordOpened {
+                    self.recordOpenedInBackgroundIfNeeded(
+                        key: key,
+                        previousStatus: readingStatusAtOpen,
+                        expectedRevision: readingRevisionAtOpen,
+                        client: client,
+                        issueWarnings: envelope.warnings
+                    )
+                }
+            } catch {
+                guard !Task.isCancelled,
+                      self.isCurrentIssueLoad(generation: generation, key: key) else { return }
+                self.finishIssueLoad(generation: generation)
+                self.show(error, retry: .loadIssue(source, date))
+            }
         }
+    }
+
+    private func applyLoadedIssue(
+        _ loadedIssue: IssueDetail,
+        warnings: [String],
+        key: IssueCacheKey
+    ) {
+        guard selectedIssue?.sourceID == key.source,
+              selectedIssue?.date == key.date else { return }
         issueDetail = loadedIssue
         selectedEditionID = loadedIssue.editions.first?.id
         dirtyUnitIDs.removeAll()
         loadEditorForSelection()
-        lastLog = envelope.warnings.joined(separator: "\n")
-        guard recordOpened, selectedReadingStatus != .completed else { return }
-        do {
-            let activity = try await client.perform(.readingMark(source: source, date: date, status: .opened))
-            await loadDashboardNow(date: date, client: client)
-            lastLog = (envelope.warnings + activity.warnings).joined(separator: "\n")
-        } catch {
-            let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-            lastLog = (envelope.warnings + ["已打开报纸，但未能记录阅读状态：\(message)"]).joined(separator: "\n")
+        lastLog = warnings.joined(separator: "\n")
+    }
+
+    private func isCurrentIssueLoad(generation: Int, key: IssueCacheKey) -> Bool {
+        generation == issueLoadGeneration
+            && selectedIssue?.sourceID == key.source
+            && selectedIssue?.date == key.date
+    }
+
+    private func finishIssueLoad(generation: Int) {
+        guard generation == issueLoadGeneration else { return }
+        issueLoadTask = nil
+        isIssueLoading = false
+        issueLoadTitle = ""
+    }
+
+    private func cancelIssueLoad() {
+        issueLoadGeneration &+= 1
+        issueLoadTask?.cancel()
+        issueLoadTask = nil
+        isIssueLoading = false
+        issueLoadTitle = ""
+    }
+
+    private func recordOpenedInBackgroundIfNeeded(
+        key: IssueCacheKey,
+        previousStatus: ReadingCompletionStatus,
+        expectedRevision: Int,
+        client: ReadDailyClient,
+        issueWarnings: [String]
+    ) {
+        guard previousStatus == .unread, readingMarkTasks[key] == nil else { return }
+        // Show immediate feedback without overwriting the last confirmed
+        // inbox/dashboard snapshot used for failure reconciliation.
+        setLocalReadingStatus(.opened, for: key, updateIssues: false)
+        let taskID = UUID()
+        readingMarkTaskIDs[key] = taskID
+        readingMarkTasks[key] = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let activity = try await client.perform(
+                    .readingMark(
+                        source: key.source,
+                        date: key.date,
+                        status: .opened,
+                        expectedRevision: expectedRevision
+                    )
+                )
+                try Task.checkCancellation()
+                guard self.readingMarkTaskIDs[key] == taskID else { return }
+                let persistedStatus = activity.data?.objectValue?["reading_status"]?.stringValue
+                    .flatMap(ReadingCompletionStatus.init(rawValue:)) ?? .opened
+                let backendRevision = activity.data?.objectValue?["reading_revision"]?.intValue
+                let knownBackendRevision = self.readingBackendRevisions[key] ?? 0
+                let effectiveResponseRevision = backendRevision ?? expectedRevision
+                guard effectiveResponseRevision >= knownBackendRevision else {
+                    // Another client or a dashboard refresh has already
+                    // observed a newer durable state. Remove only this task's
+                    // speculative `opened` overlay; never roll the confirmed
+                    // status or its known backend revision backwards.
+                    self.clearReadingStatusOverride(for: key)
+                    self.finishAutomaticReadingMark(for: key, taskID: taskID)
+                    self.lastLog = (issueWarnings + activity.warnings).joined(separator: "\n")
+                    return
+                }
+                self.setLocalReadingStatus(
+                    persistedStatus,
+                    for: key,
+                    backendRevision: backendRevision
+                )
+                self.finishAutomaticReadingMark(for: key, taskID: taskID)
+                self.lastLog = (issueWarnings + activity.warnings).joined(separator: "\n")
+            } catch {
+                let wasCancelled = Task.isCancelled
+                guard self.readingMarkTaskIDs[key] == taskID else { return }
+                guard !wasCancelled else {
+                    self.finishAutomaticReadingMark(for: key, taskID: taskID)
+                    return
+                }
+                let localRevisionBeforeReconcile = self.readingStatusRevisions[key]
+                let snapshot = await self.readingStatusSnapshot(for: key, client: client)
+                guard self.readingMarkTaskIDs[key] == taskID else { return }
+                guard self.readingStatusRevisions[key] == localRevisionBeforeReconcile else {
+                    self.finishAutomaticReadingMark(for: key, taskID: taskID)
+                    return
+                }
+                if let snapshot,
+                   snapshot.entry.readingRevision >= (self.readingBackendRevisions[key] ?? 0) {
+                    self.setLocalReadingStatus(
+                        snapshot.entry.readingStatus,
+                        for: key,
+                        backendRevision: snapshot.entry.readingRevision
+                    )
+                } else {
+                    self.clearReadingStatusOverride(for: key)
+                }
+                self.finishAutomaticReadingMark(for: key, taskID: taskID)
+                let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                self.lastLog = (
+                    issueWarnings
+                        + (snapshot?.warnings ?? [])
+                        + ["已打开报纸，但未能确认首次阅读写入：\(message)"]
+                )
+                    .joined(separator: "\n")
+            }
         }
+    }
+
+    private func finishAutomaticReadingMark(for key: IssueCacheKey, taskID: UUID) {
+        guard readingMarkTaskIDs[key] == taskID else { return }
+        readingMarkTasks[key] = nil
+        readingMarkTaskIDs[key] = nil
+    }
+
+    private func cancelAutomaticReadingMark(for key: IssueCacheKey) {
+        readingMarkTaskIDs[key] = nil
+        readingMarkTasks.removeValue(forKey: key)?.cancel()
+    }
+
+    private func readingStatus(for key: IssueCacheKey) -> ReadingCompletionStatus {
+        let inboxStatus = issues.first {
+            $0.sourceID == key.source && $0.date == key.date
+        }?.readingStatus.flatMap(ReadingCompletionStatus.init(rawValue:))
+        let dashboardStatus = dashboardDay?.entries.first {
+            $0.source.id == key.source && ($0.issue?.date ?? dashboardDay?.date) == key.date
+        }?.readingStatus
+        return readingStatusOverrides[key] ?? inboxStatus ?? dashboardStatus ?? .unread
+    }
+
+    private func readingRevision(for key: IssueCacheKey) -> Int {
+        readingBackendRevisions[key] ?? dashboardDay?.entries.first {
+            $0.source.id == key.source && ($0.issue?.date ?? dashboardDay?.date) == key.date
+        }?.readingRevision ?? 0
+    }
+
+    private func setLocalReadingStatus(
+        _ status: ReadingCompletionStatus,
+        for key: IssueCacheKey,
+        updateIssues: Bool = true,
+        backendRevision: Int? = nil
+    ) {
+        if updateIssues { noteReadingStatusChange(for: key) }
+        if let backendRevision {
+            readingBackendRevisions[key] = max(
+                readingBackendRevisions[key] ?? 0,
+                backendRevision
+            )
+        }
+        readingStatusOverrides[key] = status
+        guard updateIssues else { return }
+        issues = issues.map { issue in
+            guard issue.sourceID == key.source, issue.date == key.date else { return issue }
+            return replacingReadingStatus(in: issue, with: status.rawValue)
+        }
+    }
+
+    private func replacingReadingStatus(
+        in issue: IssueSummary,
+        with readingStatus: String?
+    ) -> IssueSummary {
+        IssueSummary(
+            id: issue.backendID,
+            sourceID: issue.sourceID,
+            sourceName: issue.sourceName,
+            date: issue.date,
+            issueNumber: issue.issueNumber,
+            stage: issue.stage,
+            readingStatus: readingStatus,
+            warningCount: issue.warningCount,
+            pageCount: issue.pageCount,
+            warnings: issue.warnings
+        )
+    }
+
+    private func clearReadingStatusOverride(for key: IssueCacheKey) {
+        readingStatusOverrides[key] = nil
+    }
+
+    private func noteReadingStatusChange(for key: IssueCacheKey) {
+        nextReadingStatusRevision &+= 1
+        readingStatusRevisions[key] = nextReadingStatusRevision
+    }
+
+    private func cachedIssue(for key: IssueCacheKey) -> IssueDetail? {
+        guard let cached = issueCache[key] else { return nil }
+        issueCacheOrder.removeAll { $0 == key }
+        issueCacheOrder.append(key)
+        return cached
+    }
+
+    private func storeIssueInCache(_ issue: IssueDetail, for key: IssueCacheKey) {
+        issueCache[key] = issue
+        issueCacheOrder.removeAll { $0 == key }
+        issueCacheOrder.append(key)
+        while issueCacheOrder.count > issueCacheCapacity {
+            issueCache.removeValue(forKey: issueCacheOrder.removeFirst())
+        }
+    }
+
+    private func removeIssueFromCache(source: String, date: String) {
+        let key = IssueCacheKey(source: source, date: date)
+        issueCache[key] = nil
+        issueCacheOrder.removeAll { $0 == key }
+    }
+
+    private func readingStatusSnapshot(
+        for key: IssueCacheKey,
+        client: ReadDailyClient
+    ) async -> (entry: DailyNewspaperEntry, warnings: [String])? {
+        do {
+            let envelope = try await client.perform(.dailyDashboard(date: key.date))
+            let day = try WorkbenchPayloadMapper().dailyDashboard(from: envelope.data)
+            guard let entry = day.entries.first(where: { $0.source.id == key.source }) else {
+                return nil
+            }
+            return (entry, envelope.warnings)
+        } catch {
+            return nil
+        }
+    }
+
+    private func invalidateIssueCache(cancelReadingMarks: Bool = false) {
+        issueCache.removeAll(keepingCapacity: true)
+        issueCacheOrder.removeAll(keepingCapacity: true)
+        guard cancelReadingMarks else { return }
+        readingMarkTasks.values.forEach { $0.cancel() }
+        readingMarkTasks.removeAll(keepingCapacity: true)
+        readingMarkTaskIDs.removeAll(keepingCapacity: true)
+        readingStatusOverrides.removeAll(keepingCapacity: true)
+        readingStatusRevisions.removeAll(keepingCapacity: true)
+        readingBackendRevisions.removeAll(keepingCapacity: true)
+        nextReadingStatusRevision = 0
     }
 
     private func loadHistoryNow(client: ReadDailyClient) async throws {
@@ -704,6 +1153,7 @@ final class ReadingDeskViewModel: ObservableObject {
 
     private func commitCurrentEditor() {
         guard let state = editorState,
+              state.hasUnsavedChanges,
               let editionID = selectedEditionID,
               var detail = issueDetail,
               let index = detail.editions.firstIndex(where: { $0.id == editionID }) else { return }
@@ -795,7 +1245,7 @@ final class ReadingDeskViewModel: ObservableObject {
         isBusy = true
         operationTitle = title
         presentedError = nil
-        retryAction = retry
+        retryAction = nil
         Task {
             defer {
                 isBusy = false
@@ -804,12 +1254,13 @@ final class ReadingDeskViewModel: ObservableObject {
             do {
                 try await operation()
             } catch {
-                show(error)
+                show(error, retry: retry)
             }
         }
     }
 
-    private func show(_ error: Error) {
+    private func show(_ error: Error, retry: RetryAction? = nil) {
+        retryAction = retry
         let localized = error as? LocalizedError
         presentedError = PresentedError(
             title: localized?.errorDescription ?? "操作失败",

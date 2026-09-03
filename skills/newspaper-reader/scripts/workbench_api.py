@@ -26,14 +26,16 @@ if str(FETCH_SCRIPTS) not in sys.path:
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
-import local_pdf  # noqa: E402
 import vault_publisher  # noqa: E402
 
 
 SCHEMA_VERSION = 1
 TOPICS = vault_publisher.TOPICS
 CONSTRUCTION_SOURCE = vault_publisher.SUPPORTED_SOURCE
-MAX_PDF_BYTES = local_pdf.MAX_PDF_BYTES
+# Keep this policy locally testable without importing the PDF ingestion stack.
+# ``local_pdf`` (and therefore its network-oriented ``lib``/``requests``
+# dependencies) is needed only by the import-file command.
+MAX_PDF_BYTES = 250 * 1024 * 1024
 DEFAULT_ARCHIVE = os.environ.get("READDAILY_ARCHIVE") or os.path.expanduser(
     "~/Library/Application Support/readdaily/news-archive"
 )
@@ -49,6 +51,16 @@ OCR_REVIEW_STATUSES = (
 READING_STATUSES = ("unread", "opened", "completed")
 _RMW_THREAD_LOCKS = {}
 _RMW_THREAD_LOCKS_GUARD = threading.Lock()
+_LOCAL_PDF_MODULE = None
+
+
+def _load_local_pdf():
+    """Load the heavyweight local-PDF importer only on the import path."""
+    global _LOCAL_PDF_MODULE
+    if _LOCAL_PDF_MODULE is None:
+        import local_pdf as module  # noqa: E402
+        _LOCAL_PDF_MODULE = module
+    return _LOCAL_PDF_MODULE
 
 # This order is a product contract, not the incidental order of sources.json.
 # Names, enabled state and channel metadata are still read from the repository
@@ -178,36 +190,67 @@ def _assert_archive_isolated(archive_root, vault_root):
 
 
 @contextlib.contextmanager
-def _archive_rmw_lock(archive_root, scope):
+def _archive_rmw_lock(archive_root, scope, archive_session=None):
     """Serialize one archive read-modify-write transaction across processes."""
-    archive_identity = os.path.realpath(str(_root(archive_root)))
+    session = archive_session or vault_publisher._active_archive_session()
+    if session is not None:
+        _verify_archive_session(session)
+        device, inode = session["root_identity"]
+        # A pathname is not a stable lock identity on case-insensitive file
+        # systems: two spellings can name the same directory.  The pinned
+        # directory inode is stable across such aliases and across processes.
+        archive_identity = "inode:%s:%s" % (device, inode)
+    else:
+        archive_identity = os.path.realpath(str(_root(archive_root)))
     lock_key = hashlib.sha256(
         (archive_identity + "\0" + str(scope)).encode("utf-8")
     ).hexdigest()
     lock_directory = Path(tempfile.gettempdir()) / "readdaily-workbench-locks"
     lock_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if lock_directory.is_symlink() or not lock_directory.is_dir():
+        raise PathSafetyError("工作台锁目录必须是真实目录")
     lock_path = lock_directory / (lock_key + ".lock")
     with _RMW_THREAD_LOCKS_GUARD:
         thread_lock = _RMW_THREAD_LOCKS.setdefault(lock_key, threading.RLock())
     with thread_lock:
-        descriptor = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        flags = os.O_CREAT | os.O_RDWR
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(str(lock_path), flags, 0o600)
+        locked = False
         try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise PathSafetyError("工作台锁必须是真实普通文件")
             fcntl.flock(descriptor, fcntl.LOCK_EX)
+            locked = True
             yield lock_path
         finally:
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                if locked:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
             finally:
                 os.close(descriptor)
 
 
 def _load_json(path, default=None):
     try:
+        session = vault_publisher._active_archive_session()
+        if session is not None:
+            relative = vault_publisher._session_relative_path(session, path)
+            if relative is not None:
+                raw = vault_publisher._archive_read_bytes(
+                    session, relative, missing_ok=True
+                )
+                if raw is None:
+                    return default
+                return json.loads(raw.decode("utf-8"))
         with open(path, encoding="utf-8") as stream:
             return json.load(stream)
     except FileNotFoundError:
         return default
-    except (OSError, ValueError) as exc:
+    except vault_publisher.PathSafetyError as exc:
+        raise PathSafetyError(str(exc)) from exc
+    except (OSError, UnicodeError, ValueError) as exc:
         raise ValidationError("JSON 无法读取：%s" % path) from exc
 
 
@@ -236,13 +279,40 @@ def _verify_archive_session(session):
 
 
 @contextlib.contextmanager
+def _archive_read_session(archive_root):
+    """Bind archive reads to one verified directory descriptor."""
+    existing = vault_publisher._active_archive_session()
+    if existing is not None:
+        configured = os.path.abspath(os.path.expanduser(str(archive_root)))
+        if configured not in (
+                existing["configured_path"], existing["canonical_path"]):
+            raise PathSafetyError("归档目录会话不能嵌套到另一目录")
+        _verify_archive_session(existing)
+        yield existing
+        _verify_archive_session(existing)
+        return
+    try:
+        with vault_publisher._pinned_directory(
+                archive_root, "归档根目录") as pinned_archive:
+            vault_publisher._PUBLISH_IO_CONTEXT.archive_session = pinned_archive
+            try:
+                _verify_archive_session(pinned_archive)
+                yield pinned_archive
+                _verify_archive_session(pinned_archive)
+            finally:
+                try:
+                    del vault_publisher._PUBLISH_IO_CONTEXT.archive_session
+                except AttributeError:
+                    pass
+    except vault_publisher.PathSafetyError as exc:
+        raise PathSafetyError(str(exc)) from exc
+
+
+@contextlib.contextmanager
 def _archive_directory_session(archive_root, vault_root):
     """Pin the user-configured archive before any validation or read."""
     try:
-        archive_context = vault_publisher._pinned_directory(
-            archive_root, "归档根目录"
-        )
-        with archive_context as pinned_archive:
+        with _archive_read_session(archive_root) as pinned_archive:
             with vault_publisher._vault_directory_session(
                     vault_root) as pinned_vault:
                 archive_path = pinned_archive["canonical_path"]
@@ -519,6 +589,16 @@ def _read_text_file(path, label, warnings):
     if path is None:
         return ""
     try:
+        session = vault_publisher._active_archive_session()
+        if session is not None:
+            relative = vault_publisher._session_relative_path(session, path)
+            if relative is not None:
+                raw = vault_publisher._archive_read_bytes(
+                    session, relative, missing_ok=True
+                )
+                if raw is None:
+                    raise FileNotFoundError(str(path))
+                return raw.decode("utf-8")
         return path.read_text(encoding="utf-8")
     except FileNotFoundError:
         warnings.append("%s 文件缺失：%s" % (label, path.name))
@@ -557,8 +637,9 @@ def _unit_text(unit, issue_dir, warnings, edition_no=None):
                     return text.strip(), "conventional_text_path"
 
     embedded = str(unit.get("text") or "").strip()
+    compact_embedded = re.sub(r"\s+", "", embedded) if embedded else ""
     parts = [embedded] if embedded else []
-    normalized_seen = {re.sub(r"\s+", "", embedded)} if embedded else set()
+    normalized_seen = {compact_embedded} if compact_embedded else set()
     for article in unit.get("articles") or []:
         article_text = str(article.get("text") or "").strip()
         if not article_text:
@@ -568,7 +649,7 @@ def _unit_text(unit, issue_dir, warnings, edition_no=None):
             continue
         # Aggregate unit.text commonly already contains every article.  Do not
         # append any article text that is already represented there.
-        if embedded and compact in re.sub(r"\s+", "", embedded):
+        if compact_embedded and compact in compact_embedded:
             continue
         if compact in normalized_seen:
             continue
@@ -715,6 +796,23 @@ def _resolve_imported_pdf(archive_root, issue, warnings):
     if not candidate.is_absolute():
         candidate = archive / candidate
     candidate = Path(os.path.abspath(str(candidate)))
+    archive_session = vault_publisher._active_archive_session()
+    if archive_session is not None:
+        try:
+            relative = vault_publisher._session_relative_path(
+                archive_session, candidate
+            )
+            if relative is None:
+                warnings.append("PDF 路径越界，已忽略")
+                return None
+            if not vault_publisher._archive_regular_path_exists(
+                    archive_session, relative):
+                warnings.append("已关联 PDF 文件缺失")
+                return None
+        except vault_publisher.PublisherError:
+            warnings.append("PDF 路径不安全，已忽略")
+            return None
+        return os.path.join(archive_session["canonical_path"], relative)
     archive_real = os.path.realpath(str(archive))
     try:
         if os.path.commonpath([archive_real, os.path.realpath(str(candidate))]) != archive_real:
@@ -729,11 +827,184 @@ def _resolve_imported_pdf(archive_root, issue, warnings):
     return str(candidate)
 
 
-def get_issue(archive_root, source, day):
+def _get_issue_overview(
+        archive_root, source, day, require_publication_evidence=False):
+    """Load list/dashboard metadata without building the full issue payload.
+
+    This deliberately reads authoritative OCR text so ``text_length`` and
+    coverage retain their existing meaning, but never creates OCR blocks.
+    Page/PDF evidence bytes are hashed only when a draft or prior publication
+    makes a security-sensitive freshness decision necessary.
+    """
     source = _validate_source(source)
     day = _validate_day(day)
     with vault_publisher._fetch_date_evidence_lock(archive_root, day):
-        return _get_issue_locked(archive_root, source, day)
+        issue_dir = _issue_dir(archive_root, source, day)
+        issue_path = issue_dir / "issue.json"
+        issue = _load_json(issue_path)
+        if issue is None:
+            raise NotFoundError("未找到 %s %s 的 issue.json" % (source, day))
+        if not isinstance(issue, dict):
+            raise ValidationError("issue.json 必须是 JSON 对象：%s" % issue_path)
+        actual_source = issue.get("source")
+        if actual_source != source:
+            raise ValidationError(
+                "issue.json source 身份不匹配：请求=%s，文件=%r" % (
+                    source, actual_source
+                )
+            )
+        actual_day = issue.get("date")
+        if actual_day != day:
+            raise ValidationError(
+                "issue.json date 身份不匹配：请求=%s，文件=%r" % (
+                    day, actual_day
+                )
+            )
+
+        warnings = list(issue.get("import_warnings") or [])
+        local_pdf_reference = bool(
+            (issue.get("files") or {}).get("local_pdf") or issue.get("pdf_path")
+        )
+        local_pdf_date_verification = (
+            str(issue.get("local_pdf_date_verification") or "unverified")
+            if local_pdf_reference else "not_applicable"
+        )
+        local_pdf_date_publishable = (
+            not local_pdf_reference or local_pdf_date_verification == "verified"
+        )
+        if not local_pdf_date_publishable:
+            warnings.append("本地 PDF 的第一页报头日期尚未唯一核验，禁止发布。")
+        if not issue.get("editions"):
+            warnings.append("期次没有版面清单")
+        if not issue.get("units"):
+            warnings.append("期次没有正文单元")
+
+        draft = _load_draft(archive_root, source, day)
+        evidence_sha256 = None
+        if draft or require_publication_evidence:
+            evidence_sha256 = vault_publisher._issue_tree_evidence_sha256(
+                archive_root, source, day
+            )
+            if not evidence_sha256:
+                raise ValidationError("本期报纸证据目录无法完整校验")
+        draft_stale = bool(draft) and not (
+            isinstance(draft.get("evidence_sha256"), str)
+            and re.fullmatch(r"[a-f0-9]{64}", draft["evidence_sha256"])
+            and hmac.compare_digest(
+                draft["evidence_sha256"], evidence_sha256
+            )
+        )
+        if draft_stale:
+            warnings.append("已有草稿基于旧版报纸证据，已隔离；请重新复核本期内容。")
+        active_draft = {} if draft_stale else draft
+        draft_sha256 = (
+            vault_publisher._draft_content_sha256(active_draft)
+            if active_draft else None
+        )
+        draft_by_id = {
+            str(item.get("id")): item
+            for item in active_draft.get("units", [])
+            if isinstance(item, dict)
+        }
+        sidecar_by_id = _summary_sidecar(archive_root, source, day)
+
+        total = 0
+        text_length = 0
+        with_text = 0
+        with_summary = 0
+        with_page = 0
+        with_draft = 0
+        thumbnail = None
+        for index, (edition, unit) in enumerate(_match_editions(issue), 1):
+            total += 1
+            item_warnings = []
+            edition_no = edition.get("no") or index
+            unit_id = str(unit.get("id") or "%s_%s_%02d" % (
+                source, day.replace("-", ""), int(edition_no)))
+            page_rel = unit.get("page_image") or edition.get("page_image")
+            page_path = _safe_issue_file(
+                issue_dir, page_rel, "版面图", item_warnings
+            )
+            if page_path is not None and not page_path.is_file():
+                item_warnings.append("版面图文件缺失：%s" % page_path.name)
+                page_path = None
+            if page_path is None:
+                item_warnings.append("第%s版缺少可用版面图" % edition_no)
+            else:
+                with_page += 1
+                if thumbnail is None:
+                    thumbnail = str(page_path)
+
+            text, _text_source = _unit_text(
+                unit, issue_dir, item_warnings, edition_no
+            )
+            text_length += len(text)
+            if text:
+                with_text += 1
+            else:
+                item_warnings.append("第%s版正文为空" % edition_no)
+
+            reviewed = draft_by_id.get(unit_id) or {}
+            old_summary, _old_importance = _existing_summary(
+                unit, sidecar_by_id.get(unit_id) or {}
+            )
+            summary = str(reviewed.get("summary") or old_summary or "").strip()
+            if summary:
+                with_summary += 1
+            else:
+                item_warnings.append("第%s版摘要尚未完成" % edition_no)
+            topics = list(reviewed.get("topics") or [])
+            facts = list(reviewed.get("facts") or [])
+            if reviewed.get("summary") and (
+                    source != CONSTRUCTION_SOURCE or (topics and facts)):
+                with_draft += 1
+            warnings.extend(item_warnings)
+
+        coverage = {
+            "editions": total,
+            "with_text": with_text,
+            "with_summary": with_summary,
+            "with_page": with_page,
+            "with_draft": with_draft,
+            "missing_text": total - with_text,
+            "missing_summary": total - with_summary,
+            "missing_page": total - with_page,
+        }
+        review_complete = bool(
+            total
+            and with_text == total
+            and with_page == total
+            and with_draft == total
+            and local_pdf_date_publishable
+        )
+        return {
+            "status": (
+                "ready_to_publish"
+                if review_complete and source == CONSTRUCTION_SOURCE
+                else "review_complete" if review_complete
+                else "needs_review"
+            ),
+            "source": source,
+            "source_name": issue.get("source_name") or source,
+            "date": day,
+            "issue_no": issue.get("issue_no"),
+            "draft_sha256": draft_sha256,
+            "draft_stale": draft_stale,
+            "evidence_sha256": evidence_sha256,
+            "coverage": coverage,
+            "text_length": text_length,
+            "thumbnail": thumbnail,
+            "pdf_path": _resolve_imported_pdf(archive_root, issue, warnings),
+            "warnings": list(dict.fromkeys(warnings)),
+        }
+
+
+def get_issue(archive_root, source, day):
+    source = _validate_source(source)
+    day = _validate_day(day)
+    with _archive_read_session(archive_root):
+        with vault_publisher._fetch_date_evidence_lock(archive_root, day):
+            return _get_issue_locked(archive_root, source, day)
 
 
 def _get_issue_locked(archive_root, source, day):
@@ -1212,7 +1483,17 @@ def _publication_matches_evidence(state, issue):
     )
 
 
+def _publication_matches_overview(state, overview):
+    """Classify published state using the same strong digests as full issue."""
+    return _publication_matches_evidence(state, overview)
+
+
 def get_inbox(archive_root, day=None, source=None):
+    with _archive_read_session(archive_root):
+        return _get_inbox_in_session(archive_root, day=day, source=source)
+
+
+def _get_inbox_in_session(archive_root, day=None, source=None):
     archive = _root(archive_root)
     day_filter = _validate_day(day) if day else None
     source_filter = _validate_source(source) if source else None
@@ -1224,8 +1505,19 @@ def get_inbox(archive_root, day=None, source=None):
         issue_day = issue_path.parent.name
         if source.startswith("_"):
             continue
+        state = _load_state(archive, source, issue_day)
+        stages = state.get("stages") or {}
+        require_publication_evidence = bool(
+            source == CONSTRUCTION_SOURCE
+            and (stages.get("published") or stages.get("archived"))
+        )
         try:
-            issue = get_issue(archive, source, issue_day)
+            issue = _get_issue_overview(
+                archive,
+                source,
+                issue_day,
+                require_publication_evidence=require_publication_evidence,
+            )
         except APIError as exc:
             rows.append({
                 "source": source, "date": issue_day, "status": "failed",
@@ -1233,10 +1525,8 @@ def get_inbox(archive_root, day=None, source=None):
                 "text_length": 0, "warnings": [str(exc)],
             })
             continue
-        state = _load_state(archive, source, issue_day)
-        stages = state.get("stages") or {}
         failed = _has_active_failure(stages)
-        published = _publication_matches_evidence(state, issue)
+        published = _publication_matches_overview(state, issue)
         if failed:
             status = "failed"
             review_status = "blocked"
@@ -1261,7 +1551,7 @@ def get_inbox(archive_root, day=None, source=None):
             "status": status,
             "review_status": review_status,
             "publish_status": publish_status,
-            "text_length": sum(len(unit["text"]) for unit in issue["units"]),
+            "text_length": issue["text_length"],
             "coverage": issue["coverage"],
             "pdf_path": issue.get("pdf_path"),
             "warnings": list(dict.fromkeys(
@@ -1292,7 +1582,8 @@ def _activity_path(archive_root, day):
 
 def _load_daily_activity(archive_root, day):
     day = _validate_day(day)
-    data = _load_json(_activity_path(archive_root, day), {}) or {}
+    with _archive_read_session(archive_root):
+        data = _load_json(_activity_path(archive_root, day), {}) or {}
     newspapers = data.get("newspapers")
     if not isinstance(newspapers, dict):
         newspapers = {}
@@ -1311,56 +1602,93 @@ def _activity_record(data, source):
             "opened_at": None,
             "completed_at": None,
             "last_read_at": None,
+            "revision": 0,
         }
     opened_at = raw.get("opened_at") if isinstance(raw.get("opened_at"), str) else None
     completed_at = raw.get("completed_at") if isinstance(raw.get("completed_at"), str) else None
+    revision = raw.get("revision")
+    if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:
+        revision = 0
     return {
         "reading_status": raw["reading_status"],
         "opened_at": opened_at,
         "completed_at": completed_at,
         "last_read_at": completed_at or opened_at,
+        "revision": revision,
     }
 
 
-def mark_reading_activity(archive_root, vault_root, source, day, status):
+def mark_reading_activity(
+        archive_root, vault_root, source, day, status, expected_revision=None):
     with _archive_directory_session(
             archive_root, vault_root) as archive_session:
         return _mark_reading_activity_in_session(
-            archive_root, vault_root, source, day, status, archive_session
+            archive_root, vault_root, source, day, status, archive_session,
+            expected_revision=expected_revision,
         )
 
 
 def _mark_reading_activity_in_session(
-        archive_root, vault_root, source, day, status, archive_session):
+        archive_root, vault_root, source, day, status, archive_session,
+        expected_revision=None):
     source = _validate_source(source)
     day = _validate_day(day)
     if source not in READ_DAILY_SOURCE_IDS:
         raise ValidationError("阅读动作仅支持已锁定8家报纸")
     if status not in READING_STATUSES:
         raise ValidationError("阅读状态必须是 unread、opened 或 completed")
+    if (expected_revision is not None
+            and (not isinstance(expected_revision, int)
+                 or isinstance(expected_revision, bool)
+                 or expected_revision < 0)):
+        raise ValidationError("阅读状态版本必须是非负整数")
     path = _activity_path(archive_root, day)
     _assert_outside_vault(path, vault_root, "阅读动作")
-    with _archive_rmw_lock(archive_root, "activity:%s" % day):
+    with _archive_rmw_lock(
+            archive_root, "activity:%s" % day,
+            archive_session=archive_session):
         if (status == "completed"
-                and not (_issue_dir(archive_root, source, day) / "issue.json").is_file()):
+                and _load_json(
+                    _issue_dir(archive_root, source, day) / "issue.json"
+                ) is None):
             raise ValidationError("缺报时不能标记阅读完成")
         data = _load_daily_activity(archive_root, day)
         existing = _activity_record(data, source)
+        if (status == "opened" and expected_revision is not None
+                and existing["revision"] != expected_revision):
+            return {
+                "status": "activity_conflict",
+                "source": source,
+                "date": day,
+                **existing,
+                "reading_revision": existing["revision"],
+                "activity_path": str(path),
+            }
+        # ``opened`` is emitted automatically after a page becomes visible.
+        # A late automatic process must never undo a newer explicit
+        # ``completed`` action.  ``unread`` remains the deliberate downgrade
+        # path exposed by the UI.
+        effective_status = (
+            "completed"
+            if status == "opened" and existing["reading_status"] == "completed"
+            else status
+        )
         now = _now()
         opened_at = existing.get("opened_at")
         completed_at = existing.get("completed_at")
-        if status == "opened":
+        if effective_status == "opened":
             opened_at = opened_at or now
             completed_at = None
-        elif status == "completed":
+        elif effective_status == "completed":
             opened_at = opened_at or now
-            completed_at = now
+            completed_at = completed_at or now
         else:
             completed_at = None
         record = {
-            "reading_status": status,
+            "reading_status": effective_status,
             "opened_at": opened_at,
             "completed_at": completed_at,
+            "revision": existing["revision"] + 1,
             "updated_at": now,
         }
         data["newspapers"][source] = record
@@ -1370,11 +1698,13 @@ def _mark_reading_activity_in_session(
             )
         except OSError as exc:
             raise PersistenceError("阅读动作保存失败：%s" % exc) from exc
+    saved = _activity_record(data, source)
     return {
         "status": "activity_saved",
         "source": source,
         "date": day,
-        **_activity_record(data, source),
+        **saved,
+        "reading_revision": saved["revision"],
         "activity_path": str(path),
     }
 
@@ -1397,6 +1727,13 @@ def _available_issue_dates(archive_root, limit=30):
 
 
 def get_daily_dashboard(archive_root, day=None, source=None):
+    with _archive_read_session(archive_root):
+        return _get_daily_dashboard_in_session(
+            archive_root, day=day, source=source
+        )
+
+
+def _get_daily_dashboard_in_session(archive_root, day=None, source=None):
     available_dates = _available_issue_dates(archive_root)
     day = _validate_day(day) if day else (
         available_dates[0] if available_dates else _datetime.date.today().isoformat()
@@ -1420,7 +1757,15 @@ def get_daily_dashboard(archive_root, day=None, source=None):
         load_error = None
         if issue_path.is_file():
             try:
-                issue = get_issue(archive_root, source_id, day)
+                issue = _get_issue_overview(
+                    archive_root,
+                    source_id,
+                    day,
+                    require_publication_evidence=bool(
+                        configured["can_publish"]
+                        and (stages.get("published") or stages.get("archived"))
+                    ),
+                )
             except APIError as exc:
                 load_error = str(exc)
         available = issue is not None
@@ -1443,7 +1788,7 @@ def get_daily_dashboard(archive_root, day=None, source=None):
             )
         )
         publication_current = bool(
-            issue and _publication_matches_evidence(state, issue)
+            issue and _publication_matches_overview(state, issue)
         )
 
         if active_failure or load_error:
@@ -1477,7 +1822,7 @@ def get_daily_dashboard(archive_root, day=None, source=None):
             review_status = "pending"
             publish_status = "not_ready" if configured["can_publish"] else "not_supported"
 
-        text_length = sum(len(unit["ocr_text"]) for unit in issue["units"]) if issue else 0
+        text_length = issue["text_length"] if issue else 0
         summarized = bool(
             coverage["editions"] and coverage["with_summary"] == coverage["editions"]
         )
@@ -1496,6 +1841,7 @@ def get_daily_dashboard(archive_root, day=None, source=None):
             "status": status,
             "acquisition_status": acquisition_status,
             "reading_status": read_record["reading_status"],
+            "reading_revision": read_record["revision"],
             "last_read_at": read_record["last_read_at"],
             "issue_no": issue.get("issue_no") if issue else None,
             "review_status": review_status,
@@ -1503,7 +1849,7 @@ def get_daily_dashboard(archive_root, day=None, source=None):
             "text_length": text_length,
             "edition_count": coverage["editions"],
             "coverage": coverage,
-            "thumbnail": issue["units"][0].get("page_image") if issue and issue["units"] else None,
+            "thumbnail": issue.get("thumbnail") if issue else None,
             "pdf_path": issue.get("pdf_path") if issue else None,
             "warnings": list(dict.fromkeys(
                 ((issue.get("warnings") or []) if issue else [])
@@ -1557,6 +1903,7 @@ def get_daily_dashboard(archive_root, day=None, source=None):
 
 
 def import_file(archive_root, pdf_path, source="zgjsb", day=None, vault_root=None):
+    local_pdf = _load_local_pdf()
     vault_root = vault_root or DEFAULT_VAULT
     _assert_archive_isolated(archive_root, vault_root)
     source = _validate_source(source)
@@ -1665,6 +2012,7 @@ def _dispatch(args):
             _require(args.source, "--source"),
             _require(args.date, "--date"),
             _require(args.status, "--status"),
+            expected_revision=args.expected_reading_revision,
         ), []
     if command == "publish-plan":
         _assert_archive_isolated(args.archive, args.vault)
@@ -1716,6 +2064,7 @@ def _parser():
     parser.add_argument("--plan-id")
     parser.add_argument("--transaction-id")
     parser.add_argument("--status")
+    parser.add_argument("--expected-reading-revision", type=int)
     parser.add_argument("--limit", type=int, default=50)
     return parser
 

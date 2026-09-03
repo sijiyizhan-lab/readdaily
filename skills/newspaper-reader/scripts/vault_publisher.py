@@ -283,6 +283,30 @@ def _session_relative_path(session, path):
         if any(part in ("", ".", "..") for part in parts):
             raise PathSafetyError("归档相对路径非法")
         return relative
+
+    # On the default case-insensitive APFS volume, issue.json may retain a
+    # different casing of the same archive root.  Do not trust lower-cased
+    # strings: pin the candidate prefix component-by-component without
+    # following symlinks and accept it only when it is the same directory
+    # inode as the already active archive session.
+    absolute_parts = [part for part in absolute.split(os.sep) if part]
+    for base in (session["configured_path"], session["canonical_path"]):
+        base_parts = [part for part in base.split(os.sep) if part]
+        if len(absolute_parts) <= len(base_parts):
+            continue
+        prefix = os.sep + os.path.join(*absolute_parts[:len(base_parts)])
+        suffix_parts = absolute_parts[len(base_parts):]
+        if any(part in ("", ".", "..") for part in suffix_parts):
+            raise PathSafetyError("归档相对路径非法")
+        try:
+            with _pinned_directory(
+                    prefix, "归档路径别名前缀") as alias_session:
+                if alias_session["root_identity"] != session["root_identity"]:
+                    continue
+                _verify_pinned_directory(session, "归档根目录")
+                return os.path.join(*suffix_parts)
+        except (PublisherError, OSError):
+            continue
     return None
 
 
@@ -395,6 +419,66 @@ def _archive_read_bytes(session, relative_path, missing_ok=False):
             raise
         _verify_archive_parent(handle)
         return raw
+
+
+def _archive_regular_sha256(session, relative_path):
+    """Stream a pinned archive file into SHA-256 without buffering it whole."""
+    with _archive_target_parent(
+            session, relative_path, create=False) as handle:
+        if handle is None:
+            return None
+        _verify_archive_parent(handle)
+        try:
+            expected = os.stat(
+                handle["name"], dir_fd=handle["parent_fd"],
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise PathSafetyError("归档证据无法安全检查") from exc
+        if stat.S_ISLNK(expected.st_mode) or not stat.S_ISREG(expected.st_mode):
+            raise PathSafetyError("归档证据必须是真实普通文件")
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(
+                handle["name"], flags, dir_fd=handle["parent_fd"]
+            )
+        except OSError as exc:
+            raise PathSafetyError("归档证据无法安全打开") from exc
+        try:
+            opened = os.fstat(descriptor)
+            if (not stat.S_ISREG(opened.st_mode)
+                    or _inode_identity(opened) != _inode_identity(expected)):
+                raise ConflictError("归档证据在校验前被替换")
+            digest = hashlib.sha256()
+            size = 0
+            while True:
+                block = os.read(descriptor, 1024 * 1024)
+                if not block:
+                    break
+                size += len(block)
+                digest.update(block)
+            after = os.fstat(descriptor)
+            try:
+                linked_after = os.stat(
+                    handle["name"], dir_fd=handle["parent_fd"],
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError as exc:
+                raise ConflictError("归档证据在校验期间消失") from exc
+            if (not stat.S_ISREG(linked_after.st_mode)
+                    or _inode_identity(after) != _inode_identity(opened)
+                    or _inode_identity(linked_after) != _inode_identity(opened)
+                    or after.st_size != opened.st_size
+                    or after.st_mtime_ns != opened.st_mtime_ns):
+                raise ConflictError("归档证据在校验期间发生变化")
+            _verify_archive_parent(handle)
+            return digest.hexdigest(), size
+        finally:
+            os.close(descriptor)
 
 
 @contextlib.contextmanager
@@ -512,6 +596,30 @@ def _archive_path_exists(session, relative_path):
             return False
         if stat.S_ISLNK(info.st_mode):
             raise PathSafetyError("归档目标不能是符号链接")
+        return True
+
+
+def _archive_regular_path_exists(session, relative_path):
+    """Check one archive-relative regular file through the pinned root."""
+    with _archive_target_parent(
+            session, relative_path, create=False) as handle:
+        if handle is None:
+            return False
+        _verify_archive_parent(handle)
+        try:
+            info = os.stat(
+                handle["name"], dir_fd=handle["parent_fd"],
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise PathSafetyError("归档文件无法安全检查") from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise PathSafetyError("归档文件不能是符号链接")
+        if not stat.S_ISREG(info.st_mode):
+            return False
+        _verify_archive_parent(handle)
         return True
 
 
@@ -773,13 +881,34 @@ def _draft_rmw_lock(archive_root, source, day):
 
 
 def _issue_tree_evidence_sha256(archive_root, source, day):
-    """Hash every regular file in one immutable issue evidence tree."""
+    """Hash the issue tree and any referenced imported source PDF."""
+    archive_session = _active_archive_session()
+    if archive_session is None:
+        # All evidence reads, including callers outside a publisher operation,
+        # are rooted at one pinned directory inode.  This prevents a
+        # swap-read-swap-back attack from supplying bytes from another tree.
+        try:
+            with _pinned_directory(
+                    archive_root, "归档根目录") as pinned_archive:
+                _PUBLISH_IO_CONTEXT.archive_session = pinned_archive
+                try:
+                    return _issue_tree_evidence_sha256(
+                        archive_root, source, day
+                    )
+                finally:
+                    try:
+                        del _PUBLISH_IO_CONTEXT.archive_session
+                    except AttributeError:
+                        pass
+        except (PublisherError, OSError, UnicodeError, ValueError):
+            return None
     archive_session = _active_archive_session()
     if archive_session is not None:
         issue_relative = os.path.join(str(source), str(day))
         digest = hashlib.sha256()
         digest.update(b"readdaily-publish-evidence-v1\0")
         saw_issue = [False]
+        issue_bytes = [None]
 
         def visit(directory_relative, output_prefix):
             names = _archive_list_directory(
@@ -822,6 +951,8 @@ def _issue_tree_evidence_sha256(archive_root, source, day):
                         return False
                     if len(raw) != before.st_size:
                         return False
+                    if relative == "issue.json":
+                        issue_bytes[0] = raw
                     relative_bytes = relative.encode("utf-8")
                     digest.update(len(relative_bytes).to_bytes(8, "big"))
                     digest.update(relative_bytes)
@@ -838,54 +969,47 @@ def _issue_tree_evidence_sha256(archive_root, source, day):
 
         try:
             complete = visit(issue_relative, "")
-        except (OSError, UnicodeError, ValueError):
-            return None
-        return digest.hexdigest() if complete and saw_issue[0] else None
-
-    issue_dir = _safe_archive_path(archive_root, source, day)
-    if (not issue_dir.is_dir() or issue_dir.is_symlink()
-            or not (issue_dir / "issue.json").is_file()):
-        return None
-    digest = hashlib.sha256()
-    digest.update(b"readdaily-publish-evidence-v1\0")
-    saw_issue = False
-    try:
-        for current, directories, filenames in os.walk(
-                str(issue_dir), topdown=True, followlinks=False):
-            directories.sort()
-            filenames.sort()
-            if any(os.path.islink(os.path.join(current, name)) for name in directories):
+            if not complete or not saw_issue[0] or issue_bytes[0] is None:
                 return None
-            for filename in filenames:
-                path = os.path.join(current, filename)
-                if os.path.islink(path):
+            issue = json.loads(issue_bytes[0].decode("utf-8"))
+            if not isinstance(issue, dict):
+                return None
+            files = issue.get("files")
+            files = files if isinstance(files, dict) else {}
+            pdf_reference = files.get("local_pdf") or issue.get("pdf_path")
+            if pdf_reference:
+                reference = os.path.expanduser(str(pdf_reference))
+                if not os.path.isabs(reference):
+                    reference = os.path.join(
+                        archive_session["configured_path"], reference
+                    )
+                pdf_relative = _session_relative_path(
+                    archive_session, reference
+                )
+                if not pdf_relative:
                     return None
-                before = os.stat(path, follow_symlinks=False)
-                if not stat.S_ISREG(before.st_mode):
+                pdf_evidence = _archive_regular_sha256(
+                    archive_session, pdf_relative
+                )
+                if pdf_evidence is None:
                     return None
-                relative = os.path.relpath(path, str(issue_dir)).replace(os.sep, "/")
-                if relative == "issue.json":
-                    saw_issue = True
-                relative_bytes = relative.encode("utf-8")
-                digest.update(len(relative_bytes).to_bytes(8, "big"))
-                digest.update(relative_bytes)
-                digest.update(before.st_size.to_bytes(8, "big"))
-                with open(path, "rb") as stream:
-                    while True:
-                        block = stream.read(1024 * 1024)
-                        if not block:
-                            break
-                        digest.update(block)
-                after = os.stat(path, follow_symlinks=False)
-                if (before.st_dev != after.st_dev
-                        or before.st_ino != after.st_ino
-                        or before.st_size != after.st_size
-                        or before.st_mtime_ns != after.st_mtime_ns):
+                pdf_sha256, _pdf_size = pdf_evidence
+                recorded_sha256 = issue.get("source_sha256")
+                if (not isinstance(recorded_sha256, str)
+                        or not re.fullmatch(
+                            r"[a-f0-9]{64}", recorded_sha256.lower()
+                        )
+                        or not hmac.compare_digest(
+                            pdf_sha256, recorded_sha256.lower()
+                        )):
                     return None
-    except (OSError, UnicodeError, ValueError):
-        return None
-    return digest.hexdigest() if saw_issue else None
-
+                # Keep the established v1 combined digest byte-for-byte
+                # compatible. issue.json already commits the recorded source
+                # hash and PDF path; the pinned streaming pass above proves
+                # those recorded bytes still match the actual imported PDF.
+        except (PublisherError, OSError, UnicodeError, ValueError):
+            return None
+        return digest.hexdigest()
 
 def validate_vault_root(vault_root):
     """Return the canonical Vault root after checking its Obsidian marker."""

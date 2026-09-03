@@ -124,6 +124,7 @@ public struct DailyNewspaperEntry: Equatable, Identifiable, Sendable {
     public let issue: IssueSummary?
     public let status: DailyRunStatus
     public let readingStatus: ReadingCompletionStatus
+    public let readingRevision: Int
 
     public var id: String { source.id }
 
@@ -131,7 +132,8 @@ public struct DailyNewspaperEntry: Equatable, Identifiable, Sendable {
         source: NewspaperSource,
         issue: IssueSummary?,
         status: DailyRunStatus? = nil,
-        readingStatus: ReadingCompletionStatus? = nil
+        readingStatus: ReadingCompletionStatus? = nil,
+        readingRevision: Int = 0
     ) {
         self.source = source
         self.issue = issue
@@ -139,6 +141,7 @@ public struct DailyNewspaperEntry: Equatable, Identifiable, Sendable {
         self.readingStatus = readingStatus
             ?? issue?.readingStatus.flatMap(ReadingCompletionStatus.init(rawValue:))
             ?? .unread
+        self.readingRevision = max(0, readingRevision)
     }
 }
 

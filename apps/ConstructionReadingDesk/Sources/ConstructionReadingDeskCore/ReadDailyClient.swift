@@ -231,7 +231,9 @@ public actor ReadDailyClient {
 
     private func validatedRequest(for command: ReadDailyAPICommand) throws -> ProcessRequest {
         let request = try ReadDailyCommandFactory(configuration: configuration).make(command)
-        let script = configuration.repositoryURL.appendingPathComponent("scripts/readdaily.py").path
+        guard let script = request.arguments.first, !script.isEmpty else {
+            throw ReadDailyClientError.scriptMissing("未指定后端脚本")
+        }
         guard FileManager.default.isReadableFile(atPath: script) else {
             throw ReadDailyClientError.scriptMissing(script)
         }

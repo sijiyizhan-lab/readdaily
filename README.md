@@ -32,7 +32,7 @@ python3 scripts/readdaily.py query "城市更新"   # 主题检索（当日演�
 open "dist/Read Daily.app"
 ```
 
-构建产物为 `dist/Read Daily.app`、版本化 ZIP 和 SHA-256 文件。应用内置后端、OCR helper 和 MIT 许可的微信文章下载组件，不依赖另行克隆本仓库；运行仍需 macOS 13+、Apple Silicon 与 Python 3，中国建设报在线生成 PDF 另需 Chrome/Chromium。当前公开包为 ad-hoc 签名、未公证版本，首次启动请在 Finder 中右键选择“打开”。详见 [应用说明](apps/ConstructionReadingDesk/README.md)与[0.3.0 发布说明](docs/releases/v0.3.0.md)。
+构建产物为 `dist/Read Daily.app`、版本化 ZIP 和 SHA-256 文件。应用内置后端、OCR helper 和 MIT 许可的微信文章下载组件，不依赖另行克隆本仓库；运行仍需 macOS 13+、Apple Silicon 与 Python 3，中国建设报在线生成 PDF 另需 Chrome/Chromium。当前公开包为 ad-hoc 签名、未公证版本，首次启动请在 Finder 中右键选择“打开”。详见 [应用说明](apps/ConstructionReadingDesk/README.md)与[0.3.1 发布说明](docs/releases/v0.3.1.md)。
 
 应用默认读取 `~/Library/Application Support/readdaily/news-archive`，Vault 默认是 `~/Maitty的知识库`，均可在设置中修改。「保存草稿」和阅读记录只写归档目录；只有中国建设报的“预览发布 → 确认发布”会写入 Vault 下的 `09-建设新闻与报纸摘要`，并保留人工内容、检测冲突、创建回滚快照。
 

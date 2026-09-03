@@ -19,6 +19,7 @@ struct ReviewEditor: View {
                         day: viewModel.dashboardDay,
                         weather: LocalWeatherSummary(configuredText: settings.weatherText),
                         sourceName: issue.sourceName,
+                        readCount: viewModel.displayedReadCount,
                         compact: layoutMode == .stacked
                     )
                     .padding(.horizontal, 20)
@@ -29,6 +30,27 @@ struct ReviewEditor: View {
                         .disabled(viewModel.isBusy)
                 }
                 .groupBoxStyle(ReadingDeskGroupBoxStyle())
+            } else if viewModel.isIssueLoading {
+                VStack(spacing: 18) {
+                    DailyBannerCarousel(
+                        date: viewModel.selectedDate,
+                        day: viewModel.dashboardDay,
+                        weather: LocalWeatherSummary(configuredText: settings.weatherText),
+                        sourceName: viewModel.selectedIssue?.sourceName,
+                        readCount: viewModel.displayedReadCount,
+                        compact: layoutMode == .stacked
+                    )
+                    VStack(spacing: 12) {
+                        ProgressView().controlSize(.regular)
+                        Text("正在读取整期报纸").font(.headline)
+                        Text(viewModel.selectedIssue?.sourceName ?? "正在准备原版与 OCR 证据…")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .readingDeskCard(cool: true)
+                }
+                .padding(20)
             } else {
                 VStack(spacing: 18) {
                     DailyBannerCarousel(
@@ -36,6 +58,7 @@ struct ReviewEditor: View {
                         day: viewModel.dashboardDay,
                         weather: LocalWeatherSummary(configuredText: settings.weatherText),
                         sourceName: nil,
+                        readCount: viewModel.displayedReadCount,
                         compact: layoutMode == .stacked
                     )
                     EmptyState(
@@ -479,6 +502,7 @@ private struct DailyBannerCarousel: View {
     let day: DailyReadingDay?
     let weather: LocalWeatherSummary
     let sourceName: String?
+    let readCount: Int
     let compact: Bool
     @State private var index = 0
     @State private var hoverPaused = false
@@ -619,7 +643,7 @@ private struct DailyBannerCarousel: View {
         switch index {
         case 1:
             guard let day else { return "等待读报数据；缺报会明确标记为当日未获取。" }
-            return "已获取 \(day.completedCount)/8 份 · 已读完 \(day.readCount)/8 份"
+            return "已获取 \(day.completedCount)/8 份 · 已读完 \(readCount)/8 份"
         case 2:
             return weather.displayText
         default:

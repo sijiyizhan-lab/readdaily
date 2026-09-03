@@ -17,11 +17,14 @@ swift run ConstructionReadingDesk
 - 报纸归档目录：默认 `~/Library/Application Support/readdaily/news-archive`
 - Obsidian Vault：默认 `~/Maitty的知识库`
 
-应用通过以下稳定接口调用后端，不通过 shell 拼接参数。Python 位置依次读取 `READDAILY_PYTHON`，再探测 Homebrew 与系统常见位置：
+应用通过参数数组调用后端，不通过 shell 拼接参数。读取工作台数据时直接运行 API 脚本以缩短每次进程启动时间；抓取仍由顶层编排器执行。Python 位置依次读取 `READDAILY_PYTHON`，再探测 Homebrew 与系统常见位置：
 
 ```text
-python3 <bundle-or-repo>/scripts/readdaily.py api <command> --archive <path> --vault <path>
+python3 <bundle-or-repo>/skills/newspaper-reader/scripts/workbench_api.py <command> --archive <path> --vault <path>
+python3 <bundle-or-repo>/scripts/readdaily.py fetch --date <date>
 ```
+
+命令行用户仍可继续使用兼容入口 `python3 scripts/readdaily.py api <command> ...`。
 
 ## 构建 `.app`
 
@@ -32,7 +35,7 @@ python3 <bundle-or-repo>/scripts/readdaily.py api <command> --archive <path> --v
 open "dist/Read Daily.app"
 ```
 
-默认产物是 `dist/Read Daily.app`，并同时生成可上传 GitHub Release 的 `dist/Read-Daily-v0.3.0-macOS-arm64.zip` 与 `.sha256`。也可传入一个以 `.app` 结尾的输出路径：
+默认产物是 `dist/Read Daily.app`，并同时生成可上传 GitHub Release 的 `dist/Read-Daily-v0.3.1-macOS-arm64.zip` 与 `.sha256`。也可传入一个以 `.app` 结尾的输出路径：
 
 ```bash
 ./scripts/build_macos_app.sh "$HOME/Desktop/Read Daily.app"
@@ -77,7 +80,7 @@ swift test --package-path apps/ConstructionReadingDesk --enable-swift-testing --
 swift build --package-path apps/ConstructionReadingDesk -c release
 ```
 
-测试覆盖版本化 Codable、真实 API 载荷映射、进程命令参数、严格 stdout JSON、中文错误、复核编辑状态、异步版图换页与响应式/可访问性策略。v0.3.0 发布基线为 61 项 Swift 测试（12 个套件）与仓库级 301 项 Python 测试。
+测试覆盖版本化 Codable、真实 API 载荷映射、进程命令参数、严格 stdout JSON、中文错误、复核编辑状态、异步版图换页、快速切报竞态、阅读状态合并、缓存失效与响应式/可访问性策略。v0.3.1 发布基线为 81 项 Swift 测试（12 个套件）与仓库级 316 项 Python 测试。
 
 ## 边界
 

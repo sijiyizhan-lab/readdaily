@@ -96,7 +96,8 @@ public struct WorkbenchPayloadMapper: Sendable {
                             source: source,
                             issue: issue,
                             status: status,
-                            readingStatus: readingStatus
+                            readingStatus: readingStatus,
+                            readingRevision: row.integer("reading_revision") ?? 0
                         )
                     }
             )

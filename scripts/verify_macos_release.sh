@@ -188,19 +188,26 @@ fi
 
 UNPACKED_RUNTIME="$UNPACKED_APP/Contents/Resources/readdaily"
 API_RESULT="$VERIFY_DIR/registry.json"
+API_COMPAT_RESULT="$VERIFY_DIR/registry-compat.json"
+PYTHONDONTWRITEBYTECODE=1 \
+  "$PYTHON_BIN" "$UNPACKED_RUNTIME/skills/newspaper-reader/scripts/workbench_api.py" \
+  newspaper-registry \
+  --archive "$VERIFY_DIR/archive" --vault "$VERIFY_DIR/vault" > "$API_RESULT"
 PYTHONDONTWRITEBYTECODE=1 \
   "$PYTHON_BIN" "$UNPACKED_RUNTIME/scripts/readdaily.py" api newspaper-registry \
-  --archive "$VERIFY_DIR/archive" --vault "$VERIFY_DIR/vault" > "$API_RESULT"
-PYTHONDONTWRITEBYTECODE=1 "$PYTHON_BIN" - "$API_RESULT" <<'PY'
+  --archive "$VERIFY_DIR/archive" --vault "$VERIFY_DIR/vault" > "$API_COMPAT_RESULT"
+PYTHONDONTWRITEBYTECODE=1 "$PYTHON_BIN" - "$API_RESULT" "$API_COMPAT_RESULT" <<'PY'
 import json
 import sys
 
 payload = json.load(open(sys.argv[1], encoding="utf-8"))
+compat_payload = json.load(open(sys.argv[2], encoding="utf-8"))
 assert payload["ok"] is True
 rows = payload["data"]["newspapers"]
 assert [row["source"] for row in rows] == [
     "rmrb", "gmrb", "jjrb", "zgjsb", "kjrb", "nmrb", "nfrb", "bjrb"
 ]
+assert compat_payload == payload
 PY
 
 PYTHONDONTWRITEBYTECODE=1 \

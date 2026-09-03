@@ -27,8 +27,16 @@ struct ConstructionReadingDeskApp: App {
                 Divider()
                 Button("保存整期草稿") { viewModel.saveDraft() }
                     .keyboardShortcut("s", modifiers: .command)
+                    .disabled(
+                        viewModel.isBusy || viewModel.isIssueLoading
+                            || viewModel.issueDetail == nil || !viewModel.hasUnsavedChanges
+                    )
                 Button("预览发布") { viewModel.previewPublish() }
                     .keyboardShortcut("p", modifiers: [.command, .shift])
+                    .disabled(
+                        viewModel.isBusy || viewModel.isIssueLoading
+                            || !viewModel.canPublishSelectedIssue
+                    )
             }
         }
 
