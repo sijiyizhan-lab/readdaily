@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>zh_CN</string>
+    <key>CFBundleDisplayName</key>
+    <string>Read Daily</string>
+    <key>CFBundleExecutable</key>
+    <string>ConstructionReadingDesk</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.guopeijun.readdaily.construction-reading-desk</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>Read Daily</string>
+    <key>CFBundleIconFile</key>
+    <string>ReadDaily.icns</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.3.3</string>
+    <key>CFBundleVersion</key>
+    <string>4</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.news</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSHumanReadableCopyright</key>
+    <string>仅供个人阅读与研究；报纸内容版权归原权利人所有。</string>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    <key>NSRequiresAquaSystemAppearance</key>
+    <false/>
+</dict>
+</plist>
